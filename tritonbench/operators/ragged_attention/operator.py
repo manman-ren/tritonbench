@@ -39,6 +39,8 @@ class Operator(BenchmarkOperator):
             self.max_seq_len,
             self.num_buckets,
             persistent_kernel=False,
+            enable_tma=False,
+            enable_ws=False,
         )
         return lambda: attn(qkv, seq_offsets, timestamps)
 
@@ -50,6 +52,34 @@ class Operator(BenchmarkOperator):
             self.max_seq_len,
             self.num_buckets,
             persistent_kernel=True,
+            enable_tma=False,
+            enable_ws=False,
+        )
+        return lambda: attn(qkv, seq_offsets, timestamps)
+
+    @register_benchmark()
+    def hstu_triton_ragged_attention_ws(self, qkv, seq_offsets, timestamps):
+        attn = RaggedHSTUAttn(
+            self.batch_size,
+            self.num_heads,
+            self.max_seq_len,
+            self.num_buckets,
+            persistent_kernel=False,
+            enable_tma=False,
+            enable_ws=True,
+        )
+        return lambda: attn(qkv, seq_offsets, timestamps)
+
+    @register_benchmark()
+    def hstu_triton_ragged_attention_tma(self, qkv, seq_offsets, timestamps):
+        attn = RaggedHSTUAttn(
+            self.batch_size,
+            self.num_heads,
+            self.max_seq_len,
+            self.num_buckets,
+            persistent_kernel=False,
+            enable_tma=True,
+            enable_ws=False,
         )
         return lambda: attn(qkv, seq_offsets, timestamps)
 
