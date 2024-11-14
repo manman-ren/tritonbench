@@ -22,7 +22,7 @@ import triton.language as tl
 
 # check if we have the TMA version in Triton PR #4498 (https://github.com/triton-lang/triton/pull/4498).
 HAS_TMA_DESC = "nv_tma_desc_type" in dir(tl)
-DATA_PARTITION = os.getenv("DATA_PARTITION_FA")
+DATA_PARTITION = True #os.getenv("DATA_PARTITION_FA")
 
 if HAS_TMA_DESC:
     print(
@@ -196,7 +196,7 @@ configsWS = [
     for w in [4]
     for buf in [2]
     for grp in [2]
-    for dec, inc in [(24, 240), (40, 232)] #32,240 hangs, 24, 240 works 40, 232 works
+    for dec, inc in [(24, 240)] #, (40, 232)] #32,240 hangs, 24, 240 works 40, 232 works
 ]
 configsOrig = [
     triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w, num_buffers_warp_spec=0, num_consumer_groups=0) if has_warp_spec else triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w)
