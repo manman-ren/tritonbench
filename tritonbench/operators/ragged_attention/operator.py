@@ -42,7 +42,7 @@ class Operator(BenchmarkOperator):
         self.sparsity = args.sparsity
         self.target_size = args.target_size
         # set a default number of inputs
-        self._num_inputs = 10 if self._num_inputs is None else self._num_inputs
+        self._num_inputs = 1 if self._num_inputs is None else self._num_inputs
         self.requires_grad = not (self.mode == Mode.FWD_NO_GRAD)
 
     @register_benchmark()
@@ -54,6 +54,22 @@ class Operator(BenchmarkOperator):
             self.num_buckets,
             self.sparsity,
             self.target_size,
+            False, #enable_ws
+            self.requires_grad,
+            persistent_kernel=False,
+        )
+        return lambda: attn(qkv, seq_offsets, timestamps, num_targets)
+
+    @register_benchmark()
+    def hstu_triton_ragged_attention_ws(self, qkv, seq_offsets, timestamps, num_targets):
+        attn = RaggedHSTUAttn(
+            self.batch_size,
+            self.num_heads,
+            self.max_seq_len,
+            self.num_buckets,
+            self.sparsity,
+            self.target_size,
+            True, #enable_ws
             self.requires_grad,
             persistent_kernel=False,
         )

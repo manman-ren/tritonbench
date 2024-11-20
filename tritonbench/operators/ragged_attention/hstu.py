@@ -48,6 +48,7 @@ class RaggedHSTUAttn(torch.nn.Module):
         num_buckets,
         sparsity,
         target_size,
+        enable_ws,
         requires_grad,
         persistent_kernel: bool = False,
     ) -> None:
@@ -58,6 +59,7 @@ class RaggedHSTUAttn(torch.nn.Module):
         self.num_buckets = num_buckets
         self.sparsity = sparsity
         self.target_size = target_size
+        self.enable_ws = enable_ws
         self.all_ts_weights = torch.nn.Parameter(
             torch.randn(
                 (self.num_buckets + 1,),
@@ -174,8 +176,9 @@ class RaggedHSTUAttn(torch.nn.Module):
                 kwargs["num_targets"],
                 kwargs["ATTN_BIAS_TYPE"],  # relative_bias_type
                 kwargs["MAX_ATTN_LEN"],  # max_attn_len
-                kwargs["contextual_seq_len"],  # contextual_seq_len
+                kwargs["CONTEXTUAL_SEQ_LEN"],  # contextual_seq_len
                 kwargs["sort_by_length_indices"],  # sort_by_length
+                self.enable_ws,
             )
 
         return out
