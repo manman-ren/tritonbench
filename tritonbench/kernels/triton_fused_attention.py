@@ -273,10 +273,12 @@ def _attn_fwd_inner_ws(
                 )
             else:
                 k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        with tl.async_task([1, 2]):
+        with tl.async_task([2]):
             if ENABLE_TMA:
                 k = tl.trans(k)
+        with tl.async_task([1]):
             qk = tl.dot(q, k)
+        with tl.async_task([2]):
             if STAGE == 2:
                 mask = offs_m[:, None] >= (start_n + offs_n[None, :])
                 qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -311,14 +313,16 @@ def _attn_fwd_inner_ws(
                     )
             else:
                 v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
-        with tl.async_task([1, 2]):
+        with tl.async_task([2]):
             if fp8_v:
                 if ENABLE_TMA:
                     v = tl.trans(v)
                 p = p.to(tl.float8e5)
             else:
                 p = p.to(tl.bfloat16)
+        with tl.async_task([1]):
             acc = tl.dot(p, v, acc)
+        with tl.async_task([2]):
             # update m_i and l_i
             m_i = m_ij
         if not ENABLE_TMA:
@@ -932,7 +936,7 @@ def _attn_fwd_compute_ws(
             LOOP_SCHEDULE,
         )
     # epilogue
-    with tl.async_task([1, 2]):
+    with tl.async_task([2]):
         m_i += tl.math.log2(l_i)
         acc = acc / l_i[:, None]
         m_ptrs = M + off_hz * N_CTX + offs_m
