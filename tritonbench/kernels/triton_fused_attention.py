@@ -246,6 +246,10 @@ def _attn_fwd_inner_ws(
     fp8_v: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
     LOOP_SCHEDULE: tl.constexpr,
+    FIRST_MMA: tl.constexpr,
+    LAST_MMA: tl.constexpr,
+    FIRST_SOFTMAX: tl.constexpr,
+    LAST_SOFTMAX: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:
@@ -273,12 +277,11 @@ def _attn_fwd_inner_ws(
                 )
             else:
                 k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        with tl.async_task([2]):
-            if ENABLE_TMA:
+        with tl.async_task([FIRST_MMA, LAST_MMA]):
+            if ENABLE_TMA: # feeds into gemm
                 k = tl.trans(k)
-        with tl.async_task([1]):
             qk = tl.dot(q, k)
-        with tl.async_task([2]):
+        with tl.async_task([FIRST_SOFTMAX, LAST_SOFTMAX]):
             if STAGE == 2:
                 mask = offs_m[:, None] >= (start_n + offs_n[None, :])
                 qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -313,16 +316,17 @@ def _attn_fwd_inner_ws(
                     )
             else:
                 v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
-        with tl.async_task([2]):
+        with tl.async_task([FIRST_SOFTMAX, LAST_SOFTMAX]): # should this be in MMA or SOFTMAX?
             if fp8_v:
-                if ENABLE_TMA:
-                    v = tl.trans(v)
                 p = p.to(tl.float8e5)
             else:
                 p = p.to(tl.bfloat16)
-        with tl.async_task([1]):
+        with tl.async_task([FIRST_MMA, LAST_MMA]):
+            if fp8_v:
+                if ENABLE_TMA:
+                    v = tl.trans(v)
             acc = tl.dot(p, v, acc)
-        with tl.async_task([2]):
+        with tl.async_task([FIRST_SOFTMAX, LAST_SOFTMAX]):
             # update m_i and l_i
             m_i = m_ij
         if not ENABLE_TMA:
@@ -437,6 +441,7 @@ configsWS = [
 ]
 # BLOCK_M: 128, BLOCK_N: 128, ENABLE_TMA: False, LOOP_SCHEDULE: default, num_warps: 8, num_ctas: 1, num_stages: 3
 if torch.version.hip is None:
+    # BLOCK_M: 128, BLOCK_N: 128, ENABLE_TMA: False, LOOP_SCHEDULE: default, num_warps: 8, num_ctas: 1, num_stages: 3
     configsOrig = [
         (
             triton.Config(
@@ -463,10 +468,10 @@ if torch.version.hip is None:
                 num_warps=w,
             )
         )
-        for BM in [64, 128]
-        for BN in [64, 128]
-        for s in ([3, 4, 7])
-        for w in [4, 8]
+        for BM in [128] #64, 128]
+        for BN in [128] #64, 128]
+        for s in ([3]) #, 4, 7])
+        for w in [8] #[4, 8]
     ]
 else:
     configsOrig = [
@@ -499,6 +504,10 @@ configsTmaWS = [
                 "BLOCK_N": BN,
                 "ENABLE_TMA": enable_tma,
                 "LOOP_SCHEDULE": sched,
+                "FIRST_MMA": 1, # a simpler config is 1, 1, 2, 2 vs 1, 2, 3, 4
+                "LAST_MMA": 2,
+                "FIRST_SOFTMAX": 3,
+                "LAST_SOFTMAX": 4,
             },
             num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
             num_warps=w,
@@ -526,7 +535,7 @@ configsTmaWS = [
     for enable_ws in [True]
     for w in [4]
     for buf in [2]
-    for grp in [2]  # 2
+    for grp in [2]  # 0 means disabling some passes, used for setting num_warps: 4 x grp
     for dec, inc in [
         (24, 240)
     ]  # , (40, 232)] #32,240 hangs, 24, 240 works 40, 232 works
@@ -806,6 +815,10 @@ def _attn_fwd_compute_ws(
     STAGE: tl.constexpr,  #
     ENABLE_TMA: tl.constexpr,
     LOOP_SCHEDULE: tl.constexpr,
+    FIRST_MMA: tl.constexpr,
+    LAST_MMA: tl.constexpr,
+    FIRST_SOFTMAX: tl.constexpr,
+    LAST_SOFTMAX: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -903,6 +916,10 @@ def _attn_fwd_compute_ws(
             V.dtype.element_ty == tl.float8e5,  #
             ENABLE_TMA,
             LOOP_SCHEDULE,
+            FIRST_MMA,
+            LAST_MMA,
+            FIRST_SOFTMAX,
+            LAST_SOFTMAX,
         )
     # stage 2: on-band
     if STAGE & 2:
@@ -934,9 +951,13 @@ def _attn_fwd_compute_ws(
             V.dtype.element_ty == tl.float8e5,  #
             ENABLE_TMA,
             LOOP_SCHEDULE,
+            FIRST_MMA,
+            LAST_MMA,
+            FIRST_SOFTMAX,
+            LAST_SOFTMAX,
         )
     # epilogue
-    with tl.async_task([2]):
+    with tl.async_task([FIRST_SOFTMAX, LAST_SOFTMAX]):
         m_i += tl.math.log2(l_i)
         acc = acc / l_i[:, None]
         m_ptrs = M + off_hz * N_CTX + offs_m
@@ -990,6 +1011,10 @@ def _attn_fwd_ws(
     ENABLE_TMA: tl.constexpr,
     LOOP_SCHEDULE: tl.constexpr,
     ENABLE_WS: tl.constexpr,
+    FIRST_MMA: tl.constexpr,
+    LAST_MMA: tl.constexpr,
+    FIRST_SOFTMAX: tl.constexpr,
+    LAST_SOFTMAX: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     pid = tl.program_id(0)
@@ -1032,6 +1057,10 @@ def _attn_fwd_ws(
         STAGE,
         ENABLE_TMA,
         LOOP_SCHEDULE,
+        FIRST_MMA,
+        LAST_MMA,
+        FIRST_SOFTMAX,
+        LAST_SOFTMAX,
     )
 
 
@@ -1326,6 +1355,10 @@ def _attn_fwd_tma_ws(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
     ENABLE_TMA: tl.constexpr,
     LOOP_SCHEDULE: tl.constexpr,
     ENABLE_WS: tl.constexpr,
+    FIRST_MMA: tl.constexpr,
+    LAST_MMA: tl.constexpr,
+    FIRST_SOFTMAX: tl.constexpr,
+    LAST_SOFTMAX: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     pid = tl.program_id(0)
@@ -1368,6 +1401,10 @@ def _attn_fwd_tma_ws(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
         STAGE,
         ENABLE_TMA,
         LOOP_SCHEDULE,
+        FIRST_MMA,
+        LAST_MMA,
+        FIRST_SOFTMAX,
+        LAST_SOFTMAX,
     )
 
 
@@ -1411,6 +1448,10 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
     LOOP_SCHEDULE: tl.constexpr,
     ENABLE_WS: tl.constexpr,
     GRID_MULTIPLE: tl.constexpr,
+    FIRST_MMA: tl.constexpr,
+    LAST_MMA: tl.constexpr,
+    FIRST_SOFTMAX: tl.constexpr,
+    LAST_SOFTMAX: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     # original grid
@@ -1470,6 +1511,10 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
             STAGE,
             ENABLE_TMA,
             LOOP_SCHEDULE,
+            FIRST_MMA,
+            LAST_MMA,
+            FIRST_SOFTMAX,
+            LAST_SOFTMAX,
         )
         tile_idx += num_progs
 
@@ -1912,8 +1957,8 @@ class _attention_opt(torch.autograd.Function):
                 o.element_size(),
             )
             return (
-                triton.cdiv(q.shape[2], META["BLOCK_M"]),
-                q.shape[0] * q.shape[1],
+                1, #triton.cdiv(q.shape[2], META["BLOCK_M"]),
+                1, #q.shape[0] * q.shape[1],
                 1,
             )
 
