@@ -479,6 +479,41 @@ else:
         for wpe in [0, 1, 2, 3, 4]
     ]
 # TMA, WS, and CompPipe
+configsTmaWSNoDP = [
+    (
+        triton.Config(
+            {
+                "BLOCK_M": BM,
+                "BLOCK_N": BN,
+                "ENABLE_TMA": enable_tma,
+                "LOOP_SCHEDULE": sched,
+                "FIRST_MMA": 1, # a simpler config is 1, 1, 2, 2 vs 1, 2, 3, 4
+                "LAST_MMA": 1,
+                "FIRST_SOFTMAX": 2,
+                "LAST_SOFTMAX": 2,
+            },
+            num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
+            num_warps=w,
+            num_buffers_warp_spec=buf,
+            num_consumer_groups=grp,
+            reg_dec_producer=dec,
+            reg_inc_consumer=inc,
+        )
+    )
+    for BM in [128]
+    for BN in [128]
+    for sched in schedList
+    for enable_tma in tmaList
+    for enable_ws in [True]
+    for w in [4]
+    for buf in [2] # 2
+    for grp in [1]  # 1 or 0 means disabling some passes, used for setting num_warps: 4 x grp
+    for dec, inc in [
+        (24, 240)
+    ]  # , (40, 232)] #32,240 hangs, 24, 240 works 40, 232 works
+]
+
+
 configsTmaWS = [
     (
         triton.Config(
@@ -1319,8 +1354,8 @@ def _attn_fwd_tma(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
         LOOP_SCHEDULE,
     )
 
-
-@triton.autotune(list(filter(keep, configsTmaWS)), key=["N_CTX"])
+# configsTmaWS or configsTmaWSNoDP
+@triton.autotune(list(filter(keep, configsTmaWSNoDP)), key=["N_CTX"])
 @triton.jit
 def _attn_fwd_tma_ws(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
     Q,
@@ -1968,8 +2003,8 @@ class _attention_opt(torch.autograd.Function):
                 return (
                     # grid partitioning: num_consumer_groups * BLOCK_M
                     # data partitioning: BLOCK_M
-                    triton.cdiv(q.shape[2], META["BLOCK_M"]),  # num_consumer_groups
-                    q.shape[0] * q.shape[1],
+                    1, #triton.cdiv(q.shape[2], META["BLOCK_M"]),  # num_consumer_groups
+                    1, #q.shape[0] * q.shape[1],
                     1,
                 )
             nonlocal desc_helper
