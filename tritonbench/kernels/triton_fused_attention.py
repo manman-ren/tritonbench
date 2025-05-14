@@ -552,8 +552,8 @@ configsTmaWS = [
     for enable_tma in tmaList
     for enable_ws in [True]
     for w in [4]
-    for buf in [0] #2]
-    for grp in [0] #2]  # 0 means disabling some passes, used for setting num_warps: 4 x grp
+    for buf in [2]
+    for grp in [2]  # 0 means disabling some passes, used for setting num_warps: 4 x grp
     for dec, inc in [
         (24, 240)
     ]  # , (40, 232)] #32,240 hangs, 24, 240 works 40, 232 works
@@ -567,6 +567,10 @@ configsTmaWSPersistent = [
                 "ENABLE_TMA": enable_tma,
                 "LOOP_SCHEDULE": sched,
                 "GRID_MULTIPLE": mult,
+                "FIRST_MMA": 1, # a simpler config is 1, 1, 2, 2 vs 1, 2, 3, 4
+                "LAST_MMA": 2,
+                "FIRST_SOFTMAX": 3,
+                "LAST_SOFTMAX": 4,
             },
             num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
             num_warps=w,
