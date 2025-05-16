@@ -213,10 +213,14 @@ def _attn_fwd_inner(
 
 @triton.jit
 def _attn_fwd_inner_ws(
-    acc,
-    l_i,
-    m_i,
-    q,  #
+    acc0,
+    acc1,
+    l_i0,
+    l_i1,
+    m_i0,
+    m_i1,
+    q0,  #
+    q1,
     K_block_ptr,
     V_block_ptr,  #
     desc_k,
@@ -232,7 +236,8 @@ def _attn_fwd_inner_ws(
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,  #
     STAGE: tl.constexpr,
-    offs_m: tl.constexpr,
+    offs_m0: tl.constexpr,
+    offs_m1: tl.constexpr,
     offs_n: tl.constexpr,  #
     N_CTX: tl.constexpr,
     fp8_v: tl.constexpr,
@@ -242,6 +247,8 @@ def _attn_fwd_inner_ws(
     LAST_MMA: tl.constexpr,
     FIRST_SOFTMAX: tl.constexpr,
     LAST_SOFTMAX: tl.constexpr,
+    LOAD_K: tl.constexpr,
+    LOAD_V: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:
@@ -259,35 +266,66 @@ def _attn_fwd_inner_ws(
     for start_n in tl.range(lo, hi, BLOCK_N):  # , loop_schedule=LOOP_SCHEDULE):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
-        with tl.async_task([0]):
+        with tl.async_task([LOAD_K]):
             if ENABLE_TMA:
                 k = desc_k.load(
                     [start_n.to(tl.int32) + (qvk_offset // stride_kn).to(tl.int32), 0]
                 )
             else:
                 k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        with tl.async_task([FIRST_MMA, LAST_MMA]):
+
+        with tl.async_task([FIRST_MMA]):
             if ENABLE_TMA: # feeds into gemm
                 k = tl.trans(k)
-            qk = tl.dot(q, k)
-        with tl.async_task([FIRST_SOFTMAX, LAST_SOFTMAX]):
+            qk0 = tl.dot(q0, k)
+            qk1 = tl.dot(q1, k)
+        with tl.async_task([FIRST_SOFTMAX]):
             if STAGE == 2:
                 mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-                qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-                m_ij = tl.maximum(m_i, tl.max(qk, 1))
-                qk -= m_ij[:, None]
+                qk0 = qk0 * qk_scale + tl.where(mask, 0, -1.0e6)
+                m_ij0 = tl.maximum(m_i0, tl.max(qk0, 1))
+                qk0 -= m_ij0[:, None]
             else:
-                m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-                qk = qk * qk_scale - m_ij[:, None]
-            p = tl.math.exp2(qk)
-            l_ij = tl.sum(p, 1)
+                m_ij0 = tl.maximum(m_i0, tl.max(qk0, 1) * qk_scale)
+                qk0 = qk0 * qk_scale - m_ij0[:, None]
+            p0 = tl.math.exp2(qk0)
+            l_ij0 = tl.sum(p0, 1)
             # -- update m_i and l_i
-            alpha = tl.math.exp2(m_i - m_ij)
-            l_i = l_i * alpha + l_ij
+            alpha0 = tl.math.exp2(m_i0 - m_ij0)
+            l_i0 = l_i0 * alpha0 + l_ij0
             # -- update output accumulator --
-            acc = acc * alpha[:, None]
+            acc0 = acc0 * alpha0[:, None]
             # update acc
-        with tl.async_task([0]):
+            if fp8_v:
+                p0 = p0.to(tl.float8e5)
+            else:
+                p0 = p0.to(tl.bfloat16)
+            # update m_i and l_i
+            m_i0 = m_ij0
+        with tl.async_task([LAST_SOFTMAX]):
+            if STAGE == 2:
+                mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+                qk1 = qk1 * qk_scale + tl.where(mask, 0, -1.0e6)
+                m_ij1 = tl.maximum(m_i1, tl.max(qk1, 1))
+                qk1 -= m_ij1[:, None]
+            else:
+                m_ij1 = tl.maximum(m_i1, tl.max(qk1, 1) * qk_scale)
+                qk1 = qk1 * qk_scale - m_ij1[:, None]
+            p1 = tl.math.exp2(qk1)
+            l_ij1 = tl.sum(p1, 1)
+            # -- update m_i and l_i
+            alpha1 = tl.math.exp2(m_i1 - m_ij1)
+            l_i1 = l_i1 * alpha1 + l_ij1
+            # -- update output accumulator --
+            acc1 = acc1 * alpha1[:, None]
+            # update acc
+            if fp8_v:
+                p1 = p1.to(tl.float8e5)
+            else:
+                p1 = p1.to(tl.bfloat16)
+            # update m_i and l_i
+            m_i1 = m_ij1
+        with tl.async_task([LOAD_V]):
             if ENABLE_TMA:
                 if fp8_v:
                     v = desc_v.load(
@@ -299,23 +337,16 @@ def _attn_fwd_inner_ws(
                     )
             else:
                 v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
-        with tl.async_task([FIRST_SOFTMAX, LAST_SOFTMAX]): # should this be in MMA or SOFTMAX?
-            if fp8_v:
-                p = p.to(tl.float8e5)
-            else:
-                p = p.to(tl.bfloat16)
-        with tl.async_task([FIRST_MMA, LAST_MMA]):
+        with tl.async_task([LAST_MMA]):
             if fp8_v:
                 if ENABLE_TMA:
                     v = tl.trans(v)
-            acc = tl.dot(p, v, acc)
-        with tl.async_task([FIRST_SOFTMAX, LAST_SOFTMAX]):
-            # update m_i and l_i
-            m_i = m_ij
+            acc0 = tl.dot(p0, v, acc0)
+            acc1 = tl.dot(p1, v, acc1)
         if not ENABLE_TMA:
             V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
             K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-    return acc, l_i, m_i
+    return acc0, acc1, l_i0, l_i1, m_i0, m_i1
 
 
 # We don't run auto-tuning every time to keep the tutorial fast. Uncommenting
@@ -563,14 +594,17 @@ configsTmaWSPersistent = [
         triton.Config(
             {
                 "BLOCK_M": BM,
+                "BLOCK_M_HALF": BMhalf,
                 "BLOCK_N": BN,
                 "ENABLE_TMA": enable_tma,
                 "LOOP_SCHEDULE": sched,
                 "GRID_MULTIPLE": mult,
-                "FIRST_MMA": 1, # a simpler config is 1, 1, 2, 2 vs 1, 2, 3, 4
-                "LAST_MMA": 2,
-                "FIRST_SOFTMAX": 3,
-                "LAST_SOFTMAX": 4,
+                "FIRST_MMA": 2, # a simpler config is 1, 1, 2, 2 vs 1, 2, 3, 4
+                "LAST_MMA": 3,
+                "FIRST_SOFTMAX": 0,
+                "LAST_SOFTMAX": 1,
+                "LOAD_K": 4,
+                "LOAD_V": 5,
             },
             num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
             num_warps=w,
@@ -593,12 +627,13 @@ configsTmaWSPersistent = [
         )
     )
     for BM in [128]
+    for BMhalf in [64]
     for BN in [128]
     for mult in [1]
     for sched in schedList
     for enable_tma in tmaList
     for enable_ws in [True]
-    for w in [4]
+    for w in [8] #4]
     for buf in [2]
     for grp in [2]  # 2
     for dec, inc in [
@@ -826,6 +861,7 @@ def _attn_fwd_compute_ws(
     H,
     N_CTX,  #: tl.constexpr,  #
     BLOCK_M: tl.constexpr,  #
+    BLOCK_M_HALF: tl.constexpr,
     BLOCK_N: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
     STAGE: tl.constexpr,  #
@@ -835,6 +871,8 @@ def _attn_fwd_compute_ws(
     LAST_MMA: tl.constexpr,
     FIRST_SOFTMAX: tl.constexpr,
     LAST_SOFTMAX: tl.constexpr,
+    LOAD_K: tl.constexpr,
+    LOAD_V: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -882,32 +920,48 @@ def _attn_fwd_compute_ws(
             order=(1, 0),
         )
     # initialize offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m0 = start_m * BLOCK_M + tl.arange(0, BLOCK_M_HALF)
+    offs_m1 = start_m * BLOCK_M + BLOCK_M_HALF + tl.arange(0, BLOCK_M_HALF)
     offs_n = tl.arange(0, BLOCK_N)
     # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    m_i0 = tl.zeros([BLOCK_M_HALF], dtype=tl.float32) - float("inf")
+    l_i0 = tl.zeros([BLOCK_M_HALF], dtype=tl.float32) + 1.0
+    acc0 = tl.zeros([BLOCK_M_HALF, HEAD_DIM], dtype=tl.float32)
+    m_i1 = tl.zeros([BLOCK_M_HALF], dtype=tl.float32) - float("inf")
+    l_i1 = tl.zeros([BLOCK_M_HALF], dtype=tl.float32) + 1.0
+    acc1 = tl.zeros([BLOCK_M_HALF, HEAD_DIM], dtype=tl.float32)
     # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
-    with tl.async_task([0]):
+    # q0 will be BLOCK_M, each kernel invocation will handle 2 * BLOCK_M
+    with tl.async_task([FIRST_SOFTMAX]):
         if ENABLE_TMA:
-            q = desc_q.load(
+            q0 = desc_q.load(
                 [(qvk_offset // stride_qm + start_m * BLOCK_M).to(tl.int32), 0]
             )
         else:
-            q = tl.load(Q_block_ptr)
+            q0 = tl.load(Q_block_ptr)
+    with tl.async_task([LAST_SOFTMAX]):
+        if ENABLE_TMA:
+            q1 = desc_q.load(
+                [(qvk_offset // stride_qm + start_m * BLOCK_M + BLOCK_M_HALF).to(tl.int32), 0]
+            )
+        else:
+            q1 = tl.load(Q_block_ptr)
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner_ws(
-            acc,
-            l_i,
-            m_i,
-            q,
+        acc0, acc1, l_i0, l_i1, m_i0, m_i1 = _attn_fwd_inner_ws(
+            acc0,
+            acc1,
+            l_i0,
+            l_i1,
+            m_i0,
+            m_i1,
+            q0,
+            q1,
             K_block_ptr,
             V_block_ptr,  #
             desc_k,
@@ -923,7 +977,8 @@ def _attn_fwd_compute_ws(
             HEAD_DIM,
             BLOCK_N,  #
             4 - STAGE,
-            offs_m,
+            offs_m0,
+            offs_m1,
             offs_n,
             N_CTX,
             V.dtype.element_ty == tl.float8e5,  #
@@ -933,6 +988,8 @@ def _attn_fwd_compute_ws(
             LAST_MMA,
             FIRST_SOFTMAX,
             LAST_SOFTMAX,
+            LOAD_K,
+            LOAD_V,
         )
     # stage 2: on-band
     if STAGE & 2:
@@ -970,15 +1027,27 @@ def _attn_fwd_compute_ws(
             LAST_SOFTMAX,
         )
     # epilogue
-    with tl.async_task([FIRST_SOFTMAX, LAST_SOFTMAX]):
-        m_i += tl.math.log2(l_i)
-        acc = acc / l_i[:, None]
-        m_ptrs = M + off_hz * N_CTX + offs_m
-        tl.store(m_ptrs, m_i)
+    with tl.async_task([FIRST_SOFTMAX]):
+        m_i0 += tl.math.log2(l_i0)
+        acc0 = acc0 / l_i0[:, None]
+        m_ptrs0 = M + off_hz * N_CTX + offs_m0
+        tl.store(m_ptrs0, m_i0)
         if ENABLE_TMA:
             desc_o.store(
                 [(qvk_offset // stride_om + start_m * BLOCK_M).to(tl.int32), 0],
-                acc.to(Out.type.element_ty),
+                acc0.to(Out.type.element_ty),
+            )
+        else:
+            tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+    with tl.async_task([LAST_SOFTMAX]):
+        m_i1 += tl.math.log2(l_i1)
+        acc1 = acc1 / l_i1[:, None]
+        m_ptrs1 = M + off_hz * N_CTX + offs_m1
+        tl.store(m_ptrs1, m_i1)
+        if ENABLE_TMA:
+            desc_o.store(
+                [(qvk_offset // stride_om + start_m * BLOCK_M + BLOCK_M_HALF).to(tl.int32), 0],
+                acc1.to(Out.type.element_ty),
             )
         else:
             tl.store(O_block_ptr, acc.to(Out.type.element_ty))
@@ -1511,6 +1580,7 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
     H,
     N_CTX,  #: tl.constexpr,  #
     BLOCK_M: tl.constexpr,  #
+    BLOCK_M_HALF: tl.constexpr,
     BLOCK_N: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
     STAGE: tl.constexpr,  #
@@ -1522,6 +1592,8 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
     LAST_MMA: tl.constexpr,
     FIRST_SOFTMAX: tl.constexpr,
     LAST_SOFTMAX: tl.constexpr,
+    LOAD_K: tl.constexpr,
+    LOAD_V: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     # original grid
@@ -1563,16 +1635,16 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
         Q,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
+        block_shape=[BLOCK_M_HALF, HEAD_DIM],
     )
     desc_o = tl.make_tensor_descriptor(
         Out,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
+        block_shape=[BLOCK_M_HALF, HEAD_DIM],
     )
 
-    for _ in range(0, tiles_per_sm):
+    for _ in tl.range(0, tiles_per_sm, num_stages=1):
         # This has much better cache locality than
         #     pid = tile_idx // (Z * H)
         #     off_hz = tile_idx % (Z * H)  # tl.program_id(1)
@@ -1611,6 +1683,7 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
             H,
             N_CTX,  #: tl.constexpr,  #
             BLOCK_M,
+            BLOCK_M_HALF,
             BLOCK_N,
             HEAD_DIM,
             STAGE,
@@ -1620,6 +1693,8 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
             LAST_MMA,
             FIRST_SOFTMAX,
             LAST_SOFTMAX,
+            LOAD_K,
+            LOAD_V,
         )
         tile_idx += num_progs
 
