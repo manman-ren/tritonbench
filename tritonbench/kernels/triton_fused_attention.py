@@ -552,8 +552,8 @@ configsTmaWS = [
     for enable_tma in tmaList
     for enable_ws in [True]
     for w in [4]
-    for buf in [0] #2]
-    for grp in [0] #2]  # 0 means disabling some passes, used for setting num_warps: 4 x grp
+    for buf in [2]
+    for grp in [2]  # 0 means disabling some passes, used for setting num_warps: 4 x grp
     for dec, inc in [
         (24, 240)
     ]  # , (40, 232)] #32,240 hangs, 24, 240 works 40, 232 works
