@@ -2147,13 +2147,12 @@ class _attention_opt(torch.autograd.Function):
         def grid_tma_persistent(META):
             if META["ENABLE_TMA"] == False or HAS_TMA_DESC == False:
                 return (
-                    #min(
-                    #    NUM_SMS * META["GRID_MULTIPLE"],
-                    #    triton.cdiv(q.shape[2], META["BLOCK_M"])
-                    #    * q.shape[0]
-                    #    * q.shape[1],
-                    #),
-                    1,
+                    min(
+                        NUM_SMS * META["GRID_MULTIPLE"],
+                        triton.cdiv(q.shape[2], META["BLOCK_M"])
+                        * q.shape[0]
+                        * q.shape[1],
+                    ),
                     1,
                     1,
                 )
@@ -2208,11 +2207,10 @@ class _attention_opt(torch.autograd.Function):
                 o.element_size(),
             )
             return (
-                #min(
-                #    NUM_SMS * META["GRID_MULTIPLE"],
-                #    triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1],
-                #),
-                1,
+                min(
+                    NUM_SMS * META["GRID_MULTIPLE"],
+                    triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1],
+                ),
                 1,
                 1,
             )
