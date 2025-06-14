@@ -252,7 +252,7 @@ def _attn_fwd_inner_ws(
         K_block_ptr = tl.advance(K_block_ptr, (0, lo))
         V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
     # loop over k, v and update accumulator
-    for start_n in tl.range(lo, hi, BLOCK_N):  # , loop_schedule=LOOP_SCHEDULE):
+    for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=True):  # , loop_schedule=LOOP_SCHEDULE):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         with tl.async_task([0]):
@@ -331,8 +331,8 @@ configsOpt = [
             },
             num_stages=4 if sched == "FA_firstDot" or sched == "FA_secondDot" else 3,
             num_warps=w,
-            num_buffers_warp_spec=0,
-            num_consumer_groups=0,
+            #num_buffers_warp_spec=0,
+            #num_consumer_groups=0,
         )
         if EXPLICIT_WARP_SPEC
         else triton.Config(
@@ -364,8 +364,8 @@ configsTma = [
             },
             num_stages=4 if sched == "FA_firstDot" or sched == "FA_secondDot" else 3,
             num_warps=w,
-            num_buffers_warp_spec=0,
-            num_consumer_groups=0,
+            #num_buffers_warp_spec=0,
+            #num_consumer_groups=0,
         )
         if EXPLICIT_WARP_SPEC
         else triton.Config(
@@ -392,10 +392,10 @@ configsWS = [
             {"BLOCK_M": BM, "BLOCK_N": BN, "ENABLE_TMA": False, "LOOP_SCHEDULE": sched},
             num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
             num_warps=w,
-            num_buffers_warp_spec=buf,
-            num_consumer_groups=grp,
-            reg_dec_producer=dec,
-            reg_inc_consumer=inc,
+            #num_buffers_warp_spec=buf,
+            #num_consumer_groups=grp,
+            #reg_dec_producer=dec,
+            #reg_inc_consumer=inc,
         )
         if EXPLICIT_WARP_SPEC
         else triton.Config(
@@ -428,8 +428,8 @@ if torch.version.hip is None:
                 },
                 num_stages=s,
                 num_warps=w,
-                num_buffers_warp_spec=0,
-                num_consumer_groups=0,
+                #num_buffers_warp_spec=0,
+                #num_consumer_groups=0,
             )
             if EXPLICIT_WARP_SPEC
             else triton.Config(
@@ -482,10 +482,10 @@ configsTmaWS = [
             },
             num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
             num_warps=w,
-            num_buffers_warp_spec=buf,
-            num_consumer_groups=grp,
-            reg_dec_producer=dec,
-            reg_inc_consumer=inc,
+            #num_buffers_warp_spec=buf,
+            #num_consumer_groups=grp,
+            #reg_dec_producer=dec,
+            #reg_inc_consumer=inc,
         )
         if EXPLICIT_WARP_SPEC
         else triton.Config(
@@ -523,10 +523,10 @@ configsTmaWSPersistent = [
             },
             num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
             num_warps=w,
-            num_buffers_warp_spec=buf,
-            num_consumer_groups=grp,
-            reg_dec_producer=dec,
-            reg_inc_consumer=inc,
+            #num_buffers_warp_spec=buf,
+            #num_consumer_groups=grp,
+            #reg_dec_producer=dec,
+            #reg_inc_consumer=inc,
         )
         if EXPLICIT_WARP_SPEC
         else triton.Config(
