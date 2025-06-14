@@ -255,14 +255,14 @@ def _attn_fwd_inner_ws(
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=True):  # , loop_schedule=LOOP_SCHEDULE):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
-        with tl.async_task([0]):
+        if True: #tl.async_task([0]):
             if ENABLE_TMA:
                 k = desc_k.load(
                     [start_n.to(tl.int32) + (qvk_offset // stride_kn).to(tl.int32), 0]
                 )
             else:
                 k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        with tl.async_task([1, 2]):
+        if True: #tl.async_task([1, 2]):
             if ENABLE_TMA:
                 k = tl.trans(k)
             qk = tl.dot(q, k)
@@ -282,7 +282,7 @@ def _attn_fwd_inner_ws(
             # -- update output accumulator --
             acc = acc * alpha[:, None]
             # update acc
-        with tl.async_task([0]):
+        if True: #tl.async_task([0]):
             if ENABLE_TMA:
                 if fp8_v:
                     v = desc_v.load(
@@ -294,7 +294,7 @@ def _attn_fwd_inner_ws(
                     )
             else:
                 v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
-        with tl.async_task([1, 2]):
+        if True: #tl.async_task([1, 2]):
             if fp8_v:
                 if ENABLE_TMA:
                     v = tl.trans(v)
@@ -837,7 +837,7 @@ def _attn_fwd_compute_ws(
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
-    with tl.async_task([0]):
+    if True: #tl.async_task([0]):
         if ENABLE_TMA:
             q = desc_q.load(
                 [(qvk_offset // stride_qm + start_m * BLOCK_M).to(tl.int32), 0]
@@ -907,7 +907,7 @@ def _attn_fwd_compute_ws(
             LOOP_SCHEDULE,
         )
     # epilogue
-    with tl.async_task([1, 2]):
+    if True: #tl.async_task([1, 2]):
         m_i += tl.math.log2(l_i)
         acc = acc / l_i[:, None]
         m_ptrs = M + off_hz * N_CTX + offs_m
