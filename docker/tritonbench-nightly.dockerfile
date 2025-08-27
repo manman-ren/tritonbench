@@ -28,7 +28,7 @@ RUN sudo mkdir -p /workspace; sudo chown runner:runner /workspace
 # We assume that the host NVIDIA driver binaries and libraries are mapped to the docker filesystem
 # Install CUDA 12.8 build toolchains
 RUN cd /workspace; mkdir -p pytorch-ci; cd pytorch-ci; wget https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cuda.sh
-RUN cd /workspace/pytorch-ci; wget https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cudnn.sh && \
+RUN cd /workspace/pytorch-ci; wget https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cudnn.sh || true && \
     wget https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_nccl.sh && \
     wget https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cusparselt.sh && \
     mkdir ci_commit_pins && cd ci_commit_pins && \
@@ -44,14 +44,14 @@ RUN cd /workspace && \
 # Test activate miniconda
 RUN . /workspace/miniconda3/etc/profile.d/conda.sh && \
     conda activate base && \
-    conda init
+    conda init && conda tos accept
 
 RUN echo "\
 . /workspace/miniconda3/etc/profile.d/conda.sh\n\
 conda activate base\n\
 export CONDA_HOME=/workspace/miniconda3\n\
 export CUDA_HOME=/usr/local/cuda\n\
-export PATH=/home/runner/bin\${PATH:+:\${PATH}}\n\
+export PATH=\${CUDA_HOME}/bin:/home/runner/bin\${PATH:+:\${PATH}}\n\
 export LD_LIBRARY_PATH=\${CUDA_HOME}/lib64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}\n\
 export LIBRARY_PATH=\${CUDA_HOME}/lib64\${LIBRARY_PATHPATH:+:\${LIBRARY_PATHPATH}}\n" >> /workspace/setup_instance.sh
 
@@ -59,7 +59,7 @@ RUN echo ". /workspace/setup_instance.sh\n" >> ${HOME}/.bashrc
 
 # Checkout TritonBench and submodules
 RUN git clone --recurse-submodules -b "${TRITONBENCH_BRANCH}" --single-branch \
-    https://github.com/pytorch-labs/tritonbench /workspace/tritonbench
+    https://github.com/meta-pytorch/tritonbench /workspace/tritonbench
 
 # Setup conda env and CUDA
 RUN cd /workspace/tritonbench && \

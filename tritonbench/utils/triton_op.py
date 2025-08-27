@@ -9,20 +9,19 @@ import os
 import random
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from itertools import product
 from numbers import Number
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
-
-import numpy
 
 import psutil
 import tabulate
@@ -80,10 +79,12 @@ class BenchmarkOperatorBackend:
 
 
 DEFAULT_WARMUP = 25
-DEFAULT_RUN_ITERS = 100
+DEFAULT_REP = 100
 DEFAULT_QUANTILES = [0.5, 0.1, 0.9]
+DEFAULT_SLEEP = 0.0
 REGISTERED_BENCHMARKS: Dict[str, OrderedDict[str, BenchmarkOperatorBackend]] = {}
-REGISTERED_METRICS: Dict[str, List[str]] = {}
+REGISTERED_METRICS: defaultdict[str, List[str]] = defaultdict(list)
+OVERRIDDEN_METRICS: defaultdict[str, List[str]] = defaultdict(list)
 REGISTERED_X_VALS: Dict[str, str] = {}
 BASELINE_BENCHMARKS: Dict[str, str] = {}
 BASELINE_SKIP_METRICS = {
@@ -94,6 +95,8 @@ BASELINE_SKIP_METRICS = {
 }
 X_ONLY_METRICS = set(["hw_roofline"])
 PRECISION_DTYPE_MAPPING = {
+    "torch.float32": torch.float32,
+    "torch.bfloat16": torch.bfloat16,
     "fp32": torch.float32,
     "tf32": torch.float32,
     "fp16": torch.float16,
@@ -125,7 +128,7 @@ class TimerContext:
             self.elapsed_ms = (end_time - self._start_time) * 1e3
 
 
-def do_bench_walltime(fn, warmup=25, rep=100):
+def do_bench_walltime(fn, warmup=25, rep=DEFAULT_REP):
     fn()
     torch.cuda.synchronize()
 
@@ -193,7 +196,7 @@ def _split_params_by_comma(params: Optional[str]) -> List[str]:
 def _find_op_name_from_module_path(module_path: str) -> str:
     PATH_PREFIX = "tritonbench.operators."
     # We have a separate operator loader for aten operator benchmark.
-    PATH_PREFIX_LOADER = "tritonbench.operator_loader."
+    PATH_PREFIX_LOADER = "tritonbench.operator_loader.loaders."
     assert (
         PATH_PREFIX in module_path or PATH_PREFIX_LOADER in module_path
     ), f"We rely on module path prefix to identify operator name. Expected {PATH_PREFIX}<operator_name>, get {module_path}."
@@ -226,8 +229,6 @@ class BenchmarkOperatorMetrics:
     compile_trace: Optional[str] = None
     # att trace directory
     att_trace: Optional[str] = None
-    # ncu trace file
-    ncu_trace: Optional[str] = None
     # ncu replay file
     ncu_rep: Optional[str] = None
     # ncu replay file with TTGIR line numbers
@@ -252,16 +253,12 @@ class BenchmarkOperatorMetrics:
     extra_metrics: Optional[Dict[str, float]] = None
     # mem footprint
     mem_footprint_compression_ratio: Optional[float] = None
-    # gbps
-    gbps: Optional[float] = None
     # speedup for the summary of kernel GPU time only
     nsys_gpu_speedup: Optional[float] = None
     # hashed source code for the kernel
     kernel_source_hash: Optional[str] = None
     # cuda time
     cuda_time: Optional[float] = None
-    # occupancy, computed as the ratio of actual GPU time to maximum possible GPU time
-    occupancy: Optional[float] = None
 
 
 BUILTIN_METRICS = {x.name for x in fields(BenchmarkOperatorMetrics)} - {"extra_metrics"}
@@ -350,11 +347,10 @@ class BenchmarkOperatorResult:
                 if len(avg_row) <= col_num:
                     avg_row.append(next_val if isinstance(next_val, Number) else None)
                 else:
-                    avg_row[col_num] = (
-                        avg_row[col_num] + next_val
-                        if isinstance(next_val, Number)
-                        else None
-                    )
+                    if avg_row[col_num] is None:
+                        avg_row[col_num] = next_val
+                    elif isinstance(next_val, Number):
+                        avg_row[col_num] = avg_row[col_num] + next_val
                 col_num += 1
             for backend in backends:
                 if x_val == "hashes" and len(hashes) > 0:
@@ -364,8 +360,16 @@ class BenchmarkOperatorResult:
                 if "kernel_source_hash" in metrics_dict:
                     hashes[backend] = metrics_dict.pop("kernel_source_hash")
                 if metrics_dict["error_msg"]:
+                    # Add error message to the display row
                     row.append(metrics_dict["error_msg"])
                     row.extend([None] * (len(key_metrics[backend]) - 1))
+
+                    # Skip this backend's metrics in the average row to maintain alignment
+                    num_metrics_to_skip = len(key_metrics[backend])
+                    for _ in range(num_metrics_to_skip):
+                        if len(avg_row) <= col_num:
+                            avg_row.append(None)
+                        col_num += 1
                     continue
                 for metric in key_metrics[backend]:
                     _metrics_dict = (
@@ -380,11 +384,10 @@ class BenchmarkOperatorResult:
                             metric_val if isinstance(metric_val, Number) else None
                         )
                     else:
-                        avg_row[col_num] = (
-                            avg_row[col_num] + metric_val
-                            if isinstance(metric_val, Number)
-                            else None
-                        )
+                        if avg_row[col_num] is None:
+                            avg_row[col_num] = metric_val
+                        elif isinstance(metric_val, Number):
+                            avg_row[col_num] = avg_row[col_num] + metric_val
                     col_num += 1
             table.append(row)
 
@@ -412,7 +415,7 @@ class BenchmarkOperatorResult:
             if isinstance(table_cell, list):
                 # Check if all elements are numbers before calculating median
                 if all(isinstance(x, Number) for x in table_cell):
-                    return numpy.median(table_cell)
+                    return statistics.median(table_cell)
                 else:
                     # For non-numeric lists, convert to string representation
                     table_cell_str = str(table_cell)
@@ -579,25 +582,32 @@ def register_x_val(label: str = "x_val"):
 
 
 def register_benchmark(
+    operator_name: Optional[str] = None,
+    func_name: Optional[str] = None,
     baseline: bool = False,
     enabled: bool = True,
     fwd_only: bool = False,
     label: Optional[str] = None,
 ):
     def decorator(function):
-        operator_name = _find_op_name_from_module_path(function.__module__)
+        op_name = (
+            _find_op_name_from_module_path(function.__module__)
+            if not operator_name
+            else operator_name
+        )
+        fn_name = function.__name__ if not func_name else func_name
         backend_config = BenchmarkOperatorBackend(
-            name=function.__name__,
-            label=label if label else function.__name__,
+            name=fn_name,
+            label=label if label else fn_name,
             baseline=baseline,
             enabled=enabled,
             fwd_only=fwd_only,
         )
-        if not operator_name in REGISTERED_BENCHMARKS:
-            REGISTERED_BENCHMARKS[operator_name] = OrderedDict()
-        REGISTERED_BENCHMARKS[operator_name][function.__name__] = backend_config
+        if op_name not in REGISTERED_BENCHMARKS:
+            REGISTERED_BENCHMARKS[op_name] = OrderedDict()
+        REGISTERED_BENCHMARKS[op_name][fn_name] = backend_config
         if backend_config.baseline:
-            BASELINE_BENCHMARKS[operator_name] = function.__name__
+            BASELINE_BENCHMARKS[op_name] = fn_name
 
         def _inner(self, *args, **kwargs):
             return function(self, *args, **kwargs)
@@ -605,43 +615,6 @@ def register_benchmark(
         return _inner
 
     return decorator
-
-
-def register_benchmark_mannually(
-    operator_name: str,
-    func_name: str,
-    baseline: bool = False,
-    enabled: bool = True,
-    label: Optional[str] = None,
-):
-    """
-    Manually register a benchmark function for a given operator.
-
-    Args:
-        operator_name (str): The name of the operator for which the benchmark is being registered.
-        func_name (str): The name of the benchmark function to register. eager or
-        inductor for aten op benchmark.
-        baseline (bool, optional): If True, this benchmark function is considered the baseline. Defaults to False.
-        enabled (bool, optional): If True, this benchmark function is enabled. Defaults to True.
-        label (Optional[str], optional): An optional label for the benchmark function. Defaults to None.
-
-    This function updates the global dictionaries REGISTERED_BENCHMARKS and BASELINE_BENCHMARKS,
-    to include the new benchmark function. If the operator or function
-    is already registered, it updates the existing entries.
-
-    We need this manually register function because decorator doesn't work for
-    dynamically created classes (operator_loader/__init__.py).
-    """
-    if not operator_name in REGISTERED_BENCHMARKS:
-        REGISTERED_BENCHMARKS[operator_name] = OrderedDict()
-    REGISTERED_BENCHMARKS[operator_name][func_name] = BenchmarkOperatorBackend(
-        name=func_name,
-        label=label if label else func_name,
-        baseline=baseline,
-        enabled=enabled,
-    )
-    if baseline:
-        BASELINE_BENCHMARKS[operator_name] = func_name
 
 
 def register_metric(
@@ -654,11 +627,11 @@ def register_metric(
 ):
     def decorator(func):
         metric_name = func.__name__
+        operator_name = _find_op_name_from_module_path(func.__module__)
         if metric_name not in BUILTIN_METRICS:
-            operator_name = _find_op_name_from_module_path(func.__module__)
-            if operator_name not in REGISTERED_METRICS:
-                REGISTERED_METRICS[operator_name] = []
             REGISTERED_METRICS[operator_name].append(func.__name__)
+        else:
+            OVERRIDDEN_METRICS[operator_name].append(metric_name)
         if skip_baseline:
             BASELINE_SKIP_METRICS.add(func.__name__)
         if x_only:
@@ -711,8 +684,8 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
     example_inputs: Any = None
     use_cuda_graphs: bool = False
     is_compute_bound = True
-    # reset dynamo to avoid errors like https://github.com/pytorch-labs/tritonbench/issues/90
-    reset_dynamo = False
+    # reset dynamo to avoid errors like https://github.com/meta-pytorch/tritonbench/issues/90
+    reset_dynamo = True
 
     """
     A base class for adding operators to torch benchmark.
@@ -747,7 +720,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         self.requires_grad = not (self.mode == Mode.FWD_NO_GRAD)
         self.device = tb_args.device
         self.required_metrics = (
-            list(set(tb_args.metrics.split(",")))
+            list(dict.fromkeys(tb_args.metrics.split(",")))
             if tb_args.metrics
             else self.DEFAULT_METRICS
         )
@@ -764,18 +737,26 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             BASELINE_BENCHMARKS[self.name] = self.tb_args.baseline
         self._only = _split_params_by_comma(self.tb_args.only)
         self._skip = _split_params_by_comma(self.tb_args.skip)
+        self._only_match_mode = self.tb_args.only_match_mode
         self._input_id = self.tb_args.input_id
         self._num_inputs = self.tb_args.num_inputs
         self.prod_shapes = self.tb_args.prod_shapes
 
     # Run the post initialization
     def __post__init__(self):
-        if is_fbcode() and self.tb_args.input_loader:
-            from tritonbench.data.fb.input_loader import get_input_loader
+        if self.tb_args.input_loader:
+            if is_fbcode() and not hasattr(self, "aten_op_name"):
+                from tritonbench.data.fb.input_loader import get_input_loader
 
-            self.get_input_iter = get_input_loader(
-                self, self.name, self.tb_args.input_loader
-            )
+                self.get_input_iter = get_input_loader(
+                    self, self.name, self.tb_args.input_loader
+                )
+            else:
+                from tritonbench.data import get_input_loader
+
+                self._get_input_iter = get_input_loader(
+                    self, self.name, self.tb_args.input_loader
+                )
         self._available_num_inputs = self.count_example_inputs()
         if self._num_inputs is None:
             self._num_inputs = self._available_num_inputs - self._input_id
@@ -828,7 +809,11 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             return fwd_no_grad_fn
 
     def run(
-        self, warmup=DEFAULT_WARMUP, rep=DEFAULT_RUN_ITERS, quantiles=DEFAULT_QUANTILES
+        self,
+        warmup=DEFAULT_WARMUP,
+        rep=DEFAULT_REP,
+        quantiles=DEFAULT_QUANTILES,
+        sleep=DEFAULT_SLEEP,
     ) -> None:
         """Benchmarking the operator and returning its metrics."""
         metrics = []
@@ -874,11 +859,34 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 self.baseline_metrics = None
                 self._op_flops = {}
                 if self._only:
-                    benchmarks = self._only
+                    if self._only_match_mode == "prefix-with-baseline":
+                        # Find all benchmarks that match any of the prefixes
+                        all_benchmarks = find_enabled_benchmarks(
+                            self.mode, REGISTERED_BENCHMARKS[self.name], []
+                        )
+                        benchmarks = []
+                        for bm in all_benchmarks:
+                            for prefix in self._only:
+                                if bm.startswith(prefix):
+                                    benchmarks.append(bm)
+                                    break
+                    else:  # exact mode (default)
+                        benchmarks = list(
+                            dict.fromkeys(self._only)
+                        )  # remove duplicates while preserving order
                 else:
                     benchmarks = find_enabled_benchmarks(
                         self.mode, REGISTERED_BENCHMARKS[self.name], self._skip
                     )
+
+                # Handle prefix-with-baseline mode
+                if (
+                    self._only_match_mode == "prefix-with-baseline"
+                    and self.name in BASELINE_BENCHMARKS
+                ):
+                    baseline_name = BASELINE_BENCHMARKS[self.name]
+                    if baseline_name not in benchmarks:
+                        benchmarks.append(baseline_name)
 
                 # Run the baseline first, if baseline exists
                 baseline_name = (
@@ -907,6 +915,9 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     )
                     if baseline:
                         self.baseline_metrics = acc[bm_name]
+                    if sleep:
+                        logging.debug(f"Sleeping for {sleep} seconds before next run")
+                        time.sleep(sleep)
                     return acc
 
                 y_vals: Dict[str, BenchmarkOperatorMetrics] = functools.reduce(
@@ -1107,47 +1118,93 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         except StopIteration:
             return None
 
-    def get_temp_path(self, path: Union[str, Path]) -> Path:
-        return Path(tempfile.gettempdir()) / "tritonbench" / self.name / Path(path)
+    def get_temp_path(
+        self,
+        fn_name: Optional[str] = None,
+    ) -> Path:
+        unix_user: Optional[str] = os.environ.get("USER", None)
+        logging_group: Optional[str] = self.logging_group
+        parts = [x for x in ["tritonbench", unix_user, logging_group] if x]
+        tritonbench_dir_name = "_".join(parts)
+        benchmark_name = self.benchmark_name
+        fn_part = f"{fn_name}_{self._input_id}" if fn_name else ""
+        out_part = Path(tempfile.gettempdir()) / tritonbench_dir_name / benchmark_name
+        return out_part / fn_part if fn_part else out_part
 
-    def _get_accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
+    @property
+    def precision(self) -> str:
+        if self.tb_args.precision == "bypass" or self.tb_args.precision == "fp8":
+            return ""
+        return self.tb_args.precision
+
+    @property
+    def benchmark_name(self, default: bool = False) -> str:
+        if not default and self.tb_args.benchmark_name:
+            return self.tb_args.benchmark_name
+        parts = [x for x in [self.precision, self.name, self.mode.value] if x]
+        return "_".join(parts)
+
+    @property
+    def logging_group(self) -> Optional[str]:
+        return self.tb_args.logging_group
+
+    def accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
         output = fn()
         baseline_output = baseline_fn()
-        accuracy = True
         try:
             if self.mode == Mode.FWD:
-                torch.testing.assert_close(output, baseline_output)
+                torch.testing.assert_close(
+                    output,
+                    baseline_output,
+                    rtol=self.tb_args.rtol,
+                    atol=self.tb_args.atol,
+                )
             elif self.mode == Mode.BWD:
-                torch.testing.assert_close(output.grad, baseline_output.grad)
+                torch.testing.assert_close(
+                    output.grad,
+                    baseline_output.grad,
+                    rtol=self.tb_args.rtol,
+                    atol=self.tb_args.atol,
+                )
             else:
                 fwd_output, loss = output
                 baseline_fwd_output, baseline_loss = baseline_output
-                torch.testing.assert_close(fwd_output, baseline_fwd_output)
-                torch.testing.assert_close(loss.grad, baseline_loss.grad)
+                torch.testing.assert_close(
+                    fwd_output,
+                    baseline_fwd_output,
+                    rtol=self.tb_args.rtol,
+                    atol=self.tb_args.atol,
+                )
+                torch.testing.assert_close(
+                    loss.grad,
+                    baseline_loss.grad,
+                    rtol=self.tb_args.rtol,
+                    atol=self.tb_args.atol,
+                )
+            return True
         except Exception:
             # either the output tensor or the loss grad tensor does not match
-            accuracy = False
-        finally:
-            return accuracy
+            return False
 
     def _do_bench(
         self,
         input_id: int,
         fn_name: str,
         warmup=DEFAULT_WARMUP,
-        rep=DEFAULT_RUN_ITERS,
+        rep=DEFAULT_REP,
         quantiles=DEFAULT_QUANTILES,
         baseline: bool = False,
     ) -> BenchmarkOperatorMetrics:
         def _init_extra_metrics() -> Dict[str, Any]:
             extra_metrics = {}
-            if self.name in REGISTERED_METRICS:
-                for metric_name in REGISTERED_METRICS[self.name]:
-                    if metric_name in BUILTIN_METRICS:
-                        continue
-                    if metric_name not in self.required_metrics:
-                        continue
-                    extra_metrics[metric_name] = None
+            required_custom_metrics = set(REGISTERED_METRICS.get(self.name, [])) & set(
+                self.required_metrics
+            )
+            for metric_name in required_custom_metrics:
+                assert (
+                    metric_name not in BUILTIN_METRICS
+                ), "Metric name {metric_name} is built-in and should be OVERRIDDEN_METRICS. Please report a bug."
+                extra_metrics[metric_name] = None
             return extra_metrics
 
         metrics = BenchmarkOperatorMetrics(
@@ -1226,19 +1283,13 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 )
             if not baseline and "accuracy" in self.required_metrics:
                 metrics.accuracy = (
-                    self._get_accuracy(fn, self.baseline_fn)
-                    if self.baseline_fn
-                    else None
+                    self.accuracy(fn, self.baseline_fn) if self.baseline_fn else None
                 )
             if "hw_roofline" in self.required_metrics:
                 metrics.hw_roofline = self.hw_roofline()
             if "tflops" in self.required_metrics and metrics.latency:
                 # cannot compute tflops without latency so adding latency to the check here
                 metrics.tflops = self.tflops(fn_name, self.example_inputs, metrics)
-            if "gbps" in self.required_metrics:
-                metrics.gbps = self.gbps(fn, self.example_inputs, metrics)
-            if "occupancy" in self.required_metrics:
-                metrics.occupancy = self.occupancy(fn, self.example_inputs, metrics)
             if "compile_time" in self.required_metrics:
                 compile_time, compile_time_by_stage = self.compile_time(
                     input_id, fn_name, metrics
@@ -1250,37 +1301,28 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 metrics.compile_trace = self.compile_time(
                     input_id, fn_name, metrics, kineto_trace=True
                 )
-            # Collect NCU metrics if any required metrics match the ncu analyzer
-            # metrics. Only profile with the necessary metrics to avoid excessive
-            # overhead.
             if not is_hip():
-                if "ncu_trace" in self.required_metrics:
-                    metrics.ncu_trace = self.ncu_trace(input_id, fn_name)
-                ncu_metrics = []
-                for (
-                    bench_metric,
-                    short_ncu_metrics,
-                ) in ncu_analyzer.bench_metric_to_short_ncu_metric.items():
-                    # Only process metrics that are required
-                    if bench_metric in self.required_metrics:
-                        # For each short metric name in the list of metrics for this benchmark metric
-                        for short_ncu_metric in short_ncu_metrics:
-                            # Get the full NCU metric name and add it to our list
-                            full_metric_name = ncu_analyzer.short_ncu_metric_name[
-                                short_ncu_metric
-                            ]
-                            ncu_metrics.append(full_metric_name)
-                extend_ncu_args = (
-                    ["--metrics", ",".join(ncu_metrics)] if ncu_metrics else None
+                # ncu metrics (ncu_rep, ncu_rep_ir, or ncu_analyzer metrics)
+                ncu_metrics: List[str] = ncu_analyzer.get_ncu_metrics(
+                    self.required_metrics
                 )
-                if ncu_metrics or "ncu_rep" in self.required_metrics:
-                    metrics.ncu_rep = self.ncu_trace(
-                        input_id, fn_name, replay=True, extend_ncu_args=extend_ncu_args
+                if (
+                    ncu_metrics
+                    or "ncu_rep" in self.required_metrics
+                    or "ncu_rep_ir" in self.required_metrics
+                ):
+                    profile_ir = "ncu_rep_ir" in self.required_metrics
+                    out = self.ncu_trace(
+                        input_id,
+                        fn_name,
+                        replay=True,
+                        extend_ncu_args=ncu_metrics,
+                        profile_ir=profile_ir,
                     )
                 # Read and update NCU metrics if any required metrics match the NCU metrics
                 if ncu_metrics:
                     ncu_analyzer_results = ncu_analyzer.read_ncu_report(
-                        metrics.ncu_rep, self.required_metrics
+                        out, self.required_metrics
                     )
                     for metric_name, metric_value in ncu_analyzer_results.items():
                         metrics.extra_metrics[metric_name] = metric_value
@@ -1288,15 +1330,12 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                         logger.warning(
                             "Arithmetic intensity only supports FP32 and FP64 for now."
                         )
+                if "ncu_rep" in self.required_metrics:
+                    metrics.ncu_rep = out
                 if "ncu_rep_ir" in self.required_metrics:
-                    metrics.ncu_rep_ir = self.ncu_trace(
-                        input_id, fn_name, replay=True, profile_ir=True
-                    )
-                nsys_metrics = []
-                for metric_name in nsys_analyzer.nsys_metrics_to_reports.keys():
-                    if metric_name in self.required_metrics:
-                        nsys_metrics.append(metric_name)
-
+                    metrics.ncu_rep_ir = out
+                # nsys metrics
+                nsys_metrics = nsys_analyzer.get_nsys_metrics(self.required_metrics)
                 if "nsys_rep" in self.required_metrics or nsys_metrics:
                     nsys_rep_path = self.nsys_rep(input_id, fn_name)
                     metrics.nsys_rep = nsys_rep_path
@@ -1360,7 +1399,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     do_compile_kineto_trace_in_task,
                 )
 
-                kineto_trace_output_dir = self.get_temp_path("kineto_trace")
+                kineto_trace_output_dir = self.get_temp_path(fn_name)
                 kineto_trace_output_dir.mkdir(parents=True, exist_ok=True)
                 metrics.extra_metrics["_compile_time_kineto_trace_in_task"] = (
                     do_compile_kineto_trace_in_task(
@@ -1468,6 +1507,8 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 self.dump_ir(input_id, fn)
         except torch.cuda.OutOfMemoryError:
             metrics.error_msg = "CUDA OOM"
+        except NotImplementedError:
+            metrics.error_msg = "not supported"
         except Exception as e:
             if not self.tb_args.keep_going:
                 raise
@@ -1591,10 +1632,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
 
     def nsys_rep(self, input_id: int, fn_name: str) -> str:
         op_task_args = self._get_op_task_args(input_id, fn_name, "_nsys_rep_in_task")
-        nsys_output_dir = self.get_temp_path(f"nsys_traces/{fn_name}_{input_id}")
+        nsys_output_dir = self.get_temp_path(fn_name)
         nsys_output_dir.mkdir(parents=True, exist_ok=True)
         ext = ".nsys-rep"
-        nsys_output_file = nsys_output_dir.joinpath(f"nsys_output{ext}").resolve()
+        nsys_output_file = nsys_output_dir.joinpath(f"nsys_rep{ext}").resolve()
         nsys_trace_cmd = [
             "nsys",
             "profile",
@@ -1625,10 +1666,14 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         profile_ir=False,
         extend_ncu_args: List[str] = None,
     ) -> str:
-        extend_ncu_args = extend_ncu_args or [
-            "--set",
-            "full",
-        ]
+        extend_ncu_args = (
+            ["--metrics", ",".join(extend_ncu_args)]
+            if extend_ncu_args
+            else [
+                "--set",
+                "full",
+            ]
+        )
         op_task_args = self._get_op_task_args(input_id, fn_name, "_ncu_trace_in_task")
         # Disable DCGM
         disable_dyno_dcgm = [
@@ -1664,11 +1709,11 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 logger.warn(
                     "DCGM may not have been successfully disabled. Proceeding to collect NCU trace anyway..."
                 )
-        ncu_output_dir = self.get_temp_path(f"ncu_traces/{fn_name}_{input_id}")
+        ncu_output_dir = self.get_temp_path(fn_name)
         ncu_output_dir.mkdir(parents=True, exist_ok=True)
         ext = ".csv" if not replay else ".ncu-rep"
         ncu_output_file = ncu_output_dir.joinpath(
-            f"ncu_output{'_ir' if profile_ir else ''}{ext}"
+            f"ncu_rep{'_ir' if profile_ir else ''}{ext}"
         ).resolve()
         ncu_args = [
             "ncu",
@@ -1711,14 +1756,14 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
 
     def att_trace(self, input_id: int, fn_name: str) -> str:
         op_task_args = self._get_op_task_args(input_id, fn_name, "_ncu_trace_in_task")
-        att_output_dir = self.get_temp_path(f"att_traces/{fn_name}_{input_id}")
+        att_output_dir = self.get_temp_path(fn_name)
         att_trace_dir = launch_att(att_output_dir, op_task_args)
         return att_trace_dir
 
     def kineto_trace(self, input_id: int, fn: Callable) -> str:
         from tritonbench.components.kineto import do_bench_kineto
 
-        kineto_output_dir = self.get_temp_path(f"kineto_traces/{fn._name}_{input_id}")
+        kineto_output_dir = self.get_temp_path(fn._name)
         kineto_output_dir.mkdir(parents=True, exist_ok=True)
         return do_bench_kineto(
             fn=fn,
@@ -1841,35 +1886,6 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         op_flops = self._op_flops[fn]
         return op_flops / metrics.latency / 1e12 * 1e3
 
-    def occupancy(
-        self, fn: Callable, example_inputs: Any, metrics: BenchmarkOperatorMetrics
-    ) -> float:
-        profile_mem = fn()
-        if profile_mem is None:
-            return None
-
-        # each row of profile_mem is (smid, start, end)
-        smids = profile_mem[:, 0]
-        start_times = profile_mem[:, 1]
-        end_times = profile_mem[:, 2]
-
-        # We use the actual number of SMs that are active to calculate occupancy.
-        # max_sm counts the total number of SMs on the device, but not all of them
-        # are active.
-        active_sm = torch.unique(smids).numel()
-        # max_sm = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-        # Wall time measures the actual time taken to run the kernel.
-        # GPU time measures the time spent on the GPU, aggregated across all SMs.
-        wall_time = torch.max(end_times) - torch.min(start_times)
-        gpu_time = torch.sum(end_times - start_times)
-
-        # We define the occupancy to be the ratio of actual GPU time to the maximum
-        # possible GPU time using the active SMs.
-        NUM_WAVES = 2
-        occupancy = gpu_time / (wall_time * active_sm) / NUM_WAVES
-        return occupancy
-
     def dump_ir(self, input_id, fn):
         from unittest import mock
 
@@ -1888,7 +1904,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             fn()
 
         if len(compiled_kernels) > 0:
-            ir_dir = self.get_temp_path("ir")
+            ir_dir = self.get_temp_path(fn._name)
             ir_dir.mkdir(parents=True, exist_ok=True)
             logger.info(
                 "Writing %s Triton IRs to %s",

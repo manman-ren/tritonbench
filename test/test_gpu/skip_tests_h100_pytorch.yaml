@@ -12,6 +12,8 @@ flash_attention:
   - triton_tutorial_flash_v2_ws
   - triton_tutorial_flash_v2_tma_ws
   - triton_tutorial_flash_v2_tma_ws_persistent
+blackwell_attentions:
+  - gluon_blackwell_fwd
 # the two requires full fbgemm instead of genai flavor
 fp8_gemm_rowwise:
 fp8_gemm_rowwise_grouped:
@@ -26,13 +28,14 @@ fp8_fused_quant_gemm_rowwise:
 gemm:
   # internal only kernels
   - hstu_triton_matmul
-  # TODO: fix PT2 cutlass
+  # pt2 cutlass kernel
   - pt2_cutlass_matmul
 # jagged tests are slow, so disable them in OSS
 jagged_layer_norm:
 jagged_mean:
 jagged_softmax:
 jagged_sum:
+gdpa:
 ragged_attention:
 # cpu-op for testing
 test_op:

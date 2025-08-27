@@ -1,7 +1,7 @@
 import argparse
 
 from tritonbench.utils.env_utils import AVAILABLE_PRECISIONS, is_fbcode
-from tritonbench.utils.triton_op import DEFAULT_RUN_ITERS, DEFAULT_WARMUP
+from tritonbench.utils.triton_op import DEFAULT_REP, DEFAULT_WARMUP
 
 
 def get_parser(args=None):
@@ -50,14 +50,21 @@ def get_parser(args=None):
     )
     parser.add_argument(
         "--warmup",
+        type=int,
         default=DEFAULT_WARMUP,
-        help="Num of warmup runs for reach benchmark run.",
+        help="Num of warmup runs for each benchmark run.",
     )
     parser.add_argument(
-        "--iter",
+        "--rep",
         type=int,
-        default=DEFAULT_RUN_ITERS,
-        help="Num of reps for each benchmark run.",
+        default=DEFAULT_REP,
+        help="The rep time for each benchmark run.",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=0.0,
+        help="The amount of time (in seconds) to sleep between benchmark runs.",
     )
     parser.add_argument(
         "--csv",
@@ -97,6 +104,16 @@ def get_parser(args=None):
         help="Metrics to collect, split with comma. E.g., --metrics latency,tflops,speedup.",
     )
     parser.add_argument(
+        "--list-metrics",
+        action="store_true",
+        help="List all available metrics. Can be used with --op or --op-collection to show operator-specific metrics.",
+    )
+    parser.add_argument(
+        "--list-backends",
+        action="store_true",
+        help="List all registerd backends per operator.",
+    )
+    parser.add_argument(
         "--metrics-gpu-backend",
         choices=["torch", "nvml"],
         default="torch",
@@ -117,6 +134,12 @@ def get_parser(args=None):
         "--skip",
         default=None,
         help="Specify one or multiple kernel implementations to skip.",
+    )
+    parser.add_argument(
+        "--only-match-mode",
+        default="exact",
+        choices=["exact", "prefix-with-baseline"],
+        help="Match mode for --only argument. 'exact' for full string match, 'prefix-with-baseline' for prefix match as well as the existing baseline. Default: exact",
     )
     parser.add_argument(
         "--baseline", type=str, default=None, help="Override default baseline."
@@ -218,20 +241,48 @@ def get_parser(args=None):
         default=None,
         help="Enable tritonparse structured logging. Optionally specify log directory path (default: ./tritonparse_logs/).",
     )
+    parser.add_argument(
+        "--input-loader",
+        type=str,
+        help="Load input file from Tritonbench data JSON.",
+    )
+    parser.add_argument(
+        "--logging-group",
+        type=str,
+        default=None,
+        help="Name of group for benchmarking.",
+    )
+    parser.add_argument(
+        "--rtol",
+        type=float,
+        default=None,
+        help="Relative tolerance for accuracy metric.",
+    )
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=None,
+        help="Absolute tolerance for accuracy metric.",
+    )
+
+    # A/B Testing parameters
+    parser.add_argument(
+        "--side-a",
+        type=str,
+        default=None,
+        help="Configuration A for A/B testing. Specify operator-specific arguments as a string. "
+        "Example: '--side-a \"--max-autotune --dynamic\"'",
+    )
+    parser.add_argument(
+        "--side-b",
+        type=str,
+        default=None,
+        help="Configuration B for A/B testing. Specify operator-specific arguments as a string. "
+        "Example: '--side-b \"--dynamic\"'",
+    )
 
     if is_fbcode():
-        parser.add_argument(
-            "--input-loader",
-            type=str,
-            help="Load input file from Tritonbench data JSON.",
-        )
         parser.add_argument("--log-scuba", action="store_true", help="Log to scuba.")
-        parser.add_argument(
-            "--logging-group",
-            type=str,
-            default=None,
-            help="Override default name for logging in scuba.",
-        )
         parser.add_argument(
             "--production-shapes",
             action="store_true",
@@ -251,4 +302,27 @@ def get_parser(args=None):
         print(
             "Neither operator nor operator collection is specified. Running all operators in the default collection."
         )
+
+    # A/B Testing validation
+    if (args.side_a is not None) != (args.side_b is not None):
+        parser.error(
+            "A/B testing requires both --side-a and --side-b arguments to be specified together"
+        )
+
+    if args.side_a is not None and args.side_b is not None:
+        # A/B mode is enabled
+        if not args.op:
+            parser.error(
+                "A/B testing requires a specific operator (--op) to be specified"
+            )
+        if args.op_collection != "default":
+            parser.error(
+                "A/B testing is only supported with single operators, not operator collections"
+            )
+        if "," in args.op:
+            parser.error(
+                "A/B testing is only supported with a single operator, not multiple operators"
+            )
+        if args.isolate:
+            parser.error("A/B testing is not compatible with --isolate mode")
     return parser

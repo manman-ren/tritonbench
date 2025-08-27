@@ -98,7 +98,7 @@ def install_fa2(compile=False):
 def install_liger():
     # Liger-kernel has a conflict dependency `triton` with pytorch,
     # so we need to install it without dependencies
-    cmd = ["pip", "install", "liger-kernel", "--no-deps"]
+    cmd = ["pip", "install", "liger-kernel-nightly", "--no-deps"]
     subprocess.check_call(cmd)
 
 
@@ -108,7 +108,7 @@ def install_tritonparse():
         "pip",
         "install",
         "-e",
-        "git+https://github.com/pytorch-labs/tritonparse.git#egg=tritonparse",
+        "git+https://github.com/meta-pytorch/tritonparse.git#egg=tritonparse",
         "--no-deps",
     ]
     subprocess.check_call(cmd)
@@ -143,6 +143,7 @@ if __name__ == "__main__":
     parser.add_argument("--jax", action="store_true", help="Install jax nightly")
     parser.add_argument("--tk", action="store_true", help="Install ThunderKittens")
     parser.add_argument("--liger", action="store_true", help="Install Liger-kernel")
+    parser.add_argument("--quack", action="store_true", help="Install quack")
     parser.add_argument("--xformers", action="store_true", help="Install xformers")
     parser.add_argument("--tile", action="store_true", help="install tile lang")
     parser.add_argument("--aiter", action="store_true", help="install AMD's aiter")
@@ -198,6 +199,11 @@ if __name__ == "__main__":
     if args.liger or args.all:
         logger.info("[tritonbench] installing liger-kernels...")
         install_liger()
+    if args.quack or args.all:
+        logger.info("[tritonbench] installing quack...")
+        from tools.quack.install import install_quack
+
+        install_quack()
     if args.xformers:
         logger.info("[tritonbench] installing xformers...")
         from tools.xformers.install import install_xformers

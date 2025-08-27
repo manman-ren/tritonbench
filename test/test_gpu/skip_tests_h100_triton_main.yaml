@@ -12,6 +12,8 @@ flash_attention:
   - triton_tutorial_flash_v2_ws
   - triton_tutorial_flash_v2_tma_ws
   - triton_tutorial_flash_v2_tma_ws_persistent
+blackwell_attentions:
+  - gluon_blackwell_fwd
 # the two requires full fbgemm instead of genai flavor
 fp8_gemm_rowwise:
 fp8_gemm_rowwise_grouped:
@@ -33,6 +35,7 @@ jagged_layer_norm:
 jagged_mean:
 jagged_softmax:
 jagged_sum:
+gdpa:
 # cpu-op for testing
 test_op:
 # TODO: decoding attention requires updated xformers and flash_attn

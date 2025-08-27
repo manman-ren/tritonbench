@@ -10,9 +10,29 @@ import triton
 
 from tritonbench.operators.gemm.kernels import matmul as kernels
 from tritonbench.operators.gemm.partition_k import matmul_partition_k
-from tritonbench.operators.gemm.stream_k import streamk_matmul
+from tritonbench.operators.gemm.stream_k import streamk_amd_matmul, streamk_cuda_matmul
+from tritonbench.operators.gemm.warp_spec_persistent_matmul import (
+    blackwell_matmul_descriptor_persistent,
+    blackwell_matmul_tma,
+    blackwell_matmul_tma_persistent,
+)
+from tritonbench.utils.triton_utils import has_tlx
+
+if has_tlx():
+    from tritonbench.operators.gemm.tlx_matmul import tlx_matmul as _tlx_matmul
+else:
+
+    def _tlx_matmul(*args, **kwargs):
+        raise RuntimeError("TLX not available in this Triton version")
+
+
 from tritonbench.utils.data_utils import get_production_shapes
-from tritonbench.utils.env_utils import is_cuda, is_fbcode, supports_tma
+from tritonbench.utils.env_utils import (
+    get_nvidia_gpu_model,
+    is_cuda,
+    is_fbcode,
+    supports_tma,
+)
 
 from tritonbench.utils.path_utils import REPO_PATH
 
@@ -93,6 +113,8 @@ SPLIT_K_SHAPES = [
     for m in [16 * i for i in range(1, 5)]
     for k in [4096 * i for i in range(1, 9)]
 ]
+
+IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
 
 
 @contextlib.contextmanager
@@ -299,12 +321,27 @@ class Operator(BenchmarkOperator):
 
         return lambda: compiled(a, b)
 
-    @register_benchmark()
+    @register_benchmark(enabled=not is_cuda())
     def streamk_matmul(self, a, b, bias) -> Callable:
-        if bias is not None:
-            return lambda: streamk_matmul(a, b, bias)
-        else:
-            return lambda: streamk_matmul(a, b)
+        return (
+            lambda: streamk_amd_matmul(a, b, bias) if bias else streamk_amd_matmul(a, b)
+        )
+
+    @register_benchmark(enabled=is_cuda())
+    def streamk_matmul(self, a, b, bias) -> Callable:
+        print(f"Testing shape: {a.shape} x {b.shape}...")
+        streamk = torch.matmul(a, b)
+        b = b.T.contiguous()
+        baseline = streamk_cuda_matmul(a, b)
+        if not torch.allclose(streamk, baseline):
+            print(
+                f"StreamK matmul on {a.shape} x {b.shape} result does not match baseline matmul result. Max abs(streamk/baseline - 1):  {torch.max(torch.abs(streamk / baseline - 1))}"
+            )
+        return (
+            lambda: streamk_cuda_matmul(a, b) + bias
+            if bias
+            else streamk_cuda_matmul(a, b)
+        )
 
     @register_benchmark(enabled=is_cuda())
     def pt2_cutlass_matmul(self, a, b, bias) -> Callable:
@@ -323,7 +360,7 @@ class Operator(BenchmarkOperator):
             compiled(a, b)
         return lambda: compiled(a, b)
 
-    @register_benchmark()
+    @register_benchmark(enabled=False)
     def matmul_decompose_k(self, a, b, bias) -> Callable:
         def decompose_func(a_in, b_in):
             M, K = a_in.shape
@@ -349,6 +386,81 @@ class Operator(BenchmarkOperator):
             return lambda: compiled_decompose_k(a, b) + bias
         else:
             return lambda: compiled_decompose_k(a, b)
+
+    if IS_B200:
+
+        @register_benchmark(enabled=False)
+        def triton_blackwell_warpspec_persistent_matmul(self, a, b, bias) -> Callable:
+            if bias is not None:
+                return (
+                    lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=True)
+                    + bias
+                )
+            else:
+                return lambda: blackwell_matmul_tma_persistent(
+                    a, b, warp_specialize=True
+                )
+
+        @register_benchmark(enabled=False)
+        def triton_blackwell_persistent_matmul(self, a, b, bias) -> Callable:
+            if bias is not None:
+                return (
+                    lambda: blackwell_matmul_tma_persistent(a, b, warp_specialize=False)
+                    + bias
+                )
+            else:
+                return lambda: blackwell_matmul_tma_persistent(
+                    a, b, warp_specialize=False
+                )
+
+        @register_benchmark(enabled=False)
+        def triton_blackwell_warpspec_tma_matmul(self, a, b, bias) -> Callable:
+            if bias is not None:
+                return lambda: blackwell_matmul_tma(a, b, warp_specialize=True) + bias
+            else:
+                return lambda: blackwell_matmul_tma(a, b, warp_specialize=True)
+
+        @register_benchmark(enabled=False)
+        def triton_blackwell_tma_matmul(self, a, b, bias) -> Callable:
+            if bias is not None:
+                return lambda: blackwell_matmul_tma(a, b, warp_specialize=False) + bias
+            else:
+                return lambda: blackwell_matmul_tma(a, b, warp_specialize=False)
+
+        @register_benchmark(enabled=False)
+        def triton_blackwell_warpspec_descriptor_matmul(self, a, b, bias) -> Callable:
+            if bias is not None:
+                return (
+                    lambda: blackwell_matmul_descriptor_persistent(
+                        a, b, warp_specialize=True
+                    )
+                    + bias
+                )
+            else:
+                return lambda: blackwell_matmul_descriptor_persistent(
+                    a, b, warp_specialize=True
+                )
+
+        @register_benchmark(enabled=False)
+        def triton_blackwell_descriptor_matmul(self, a, b, bias) -> Callable:
+            if bias is not None:
+                return (
+                    lambda: blackwell_matmul_descriptor_persistent(
+                        a, b, warp_specialize=False
+                    )
+                    + bias
+                )
+            else:
+                return lambda: blackwell_matmul_descriptor_persistent(
+                    a, b, warp_specialize=False
+                )
+
+        @register_benchmark(enabled=False)
+        def tlx_matmul(self, a, b, bias) -> Callable:
+            if bias is not None:
+                return lambda: _tlx_matmul(a, b) + bias
+            else:
+                return lambda: _tlx_matmul(a, b)
 
     @register_x_val(label="(M, N, K)")
     def get_x_val(self, example_inputs) -> Tuple[int, int, int]:

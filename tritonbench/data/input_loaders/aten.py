@@ -1,25 +1,21 @@
+"""
+Load aten inputs from serialized txt files.
+"""
+
 import functools
 import logging
 import math
-import os
 from collections import Counter, defaultdict
-from functools import partial
-from typing import Any, Dict, Generator, Iterable, Tuple
+from pathlib import Path
+from typing import Any, Callable, Generator
 
 import torch
 from torch.testing import make_tensor
 from torch.utils import _pytree as pytree
-from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map
 
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)
-
-OP_INP_DIRECTORY = os.path.join(os.path.dirname(__file__), "operator_inp_logs")
-
-TIMM_DIR = os.path.join(OP_INP_DIRECTORY, "timm_train")
-HF_DIR = os.path.join(OP_INP_DIRECTORY, "hf_train")
-TORCHBENCH_DIR = os.path.join(OP_INP_DIRECTORY, "torchbench_train")
 
 aten = torch.ops.aten
 tensor_type = torch._C.TensorType.get()
@@ -41,6 +37,8 @@ dtype_abbrs = {
 }
 
 dtype_abbrs_parsing = {value: key for key, value in dtype_abbrs.items()}
+
+INPUT_CONFIG_DIR = Path(__file__).parent.parent.joinpath("input_configs")
 
 
 def truncate_inp(arg):
@@ -81,7 +79,7 @@ def serialize_sparse_tensor(e):
 
 
 def deserialize_sparse_tensor(size, dtype, layout, is_coalesced, nnz=None):
-    raise NotImplementedError
+    raise NotImplementedError("Sparse Tensor generation is not implemented.")
 
 
 def deserialize_tensor(size, dtype, stride=None):
@@ -95,22 +93,6 @@ def deserialize_tensor(size, dtype, stride=None):
         print(e)
         return out
     return out
-
-
-def serialize_tensor(e):
-    if not e.is_contiguous():
-        return FuncCallWrapper("T", list(e.shape), e.dtype, stride=e.stride())
-    else:
-        return FuncCallWrapper("T", list(e.shape), e.dtype)
-
-
-def serialize_torch_args(e):
-    if isinstance(e, torch.Tensor):
-        if e.is_sparse:
-            return serialize_sparse_tensor(e)
-        return serialize_tensor(e)
-    else:
-        return truncate_inp(e)
 
 
 def contains_tensor(elems):
@@ -165,61 +147,6 @@ def non_compute_operator(op):
     return False
 
 
-class OperatorInputsMode(TorchDispatchMode):
-    def __init__(self, func_db=None):
-        self.func_db = defaultdict(Counter) if func_db is None else func_db
-
-    def __torch_dispatch__(self, func_overload, types, args=(), kwargs=None):
-        kwargs = kwargs if kwargs else {}
-        arg_meta, kwarg_meta = tree_map(serialize_torch_args, (args, kwargs))
-
-        out = func_overload(*args, **kwargs)
-
-        inps = (args, kwargs)
-        if contains_tensor(inps) and not skip_args(inps) and contains_tensor(out):
-            serialized_str = repr((arg_meta, kwarg_meta))
-            self.func_db[str(func_overload)][serialized_str] += 1
-
-        return out
-
-    def log_to_file(self, output_filename, *, skip_non_compute_operators=True):
-        sorted_operators = sorted(self.func_db.keys())
-        with open(output_filename, "w") as f:
-            for operator in sorted_operators:
-                if skip_non_compute_operators and non_compute_operator(eval(operator)):
-                    continue
-                f.write(f"Operator: {operator}\n")
-                operator_inputs = self.func_db[operator]
-                for inps, count in operator_inputs.items():
-                    f.write(f"cnt: {count}, ")
-                    # repr will add quotation marks around the dtype strings
-                    for dtype_abbr in dtype_abbrs.values():
-                        inps = inps.replace("'" + dtype_abbr + "'", dtype_abbr)
-                    f.write(inps)
-                    f.write("\n")
-
-
-def map_to_device(e, device):
-    if isinstance(e, torch.Tensor):
-        return e.to(device)
-    elif isinstance(e, torch.device):
-        return device
-    elif isinstance(e, str):
-        if e == "cuda" or e == "cpu":
-            return device.type
-    else:
-        return e
-
-
-def map_to_dtype(e, dtype):
-    if isinstance(e, torch.Tensor) and e.is_floating_point():
-        return e.to(dtype)
-    elif isinstance(e, torch.dtype):
-        return dtype
-    else:
-        return e
-
-
 def deserialize_args(inps):
     inps = inps.strip().strip("'")
     global_vals = {
@@ -237,10 +164,11 @@ def deserialize_args(inps):
 
 
 class OperatorInputsLoader:
-    def __init__(self, json_file_path):
+    def __init__(self, op_name: str, txt_file_path: str):
+        self.op_name = op_name
         self.operator_db = defaultdict(Counter)
 
-        with open(json_file_path) as f:
+        with open(txt_file_path) as f:
             lines = f.readlines()
 
         i = 0
@@ -255,48 +183,37 @@ class OperatorInputsLoader:
             i += 1
             while i < len(lines) and "Operator: " not in lines[i]:
                 line = lines[i]
-                cnt = eval(line[len("cnt: ") : line.find(",")])
+                cnt = int(line[len("cnt: ") : line.find(",")])
                 inps = line[line.find(",") + 2 :].strip("'")
                 op_inps[inps] += cnt
                 i += 1
             self.operator_db[operator] = op_inps
-
-    def get_inputs_for_operator(
-        self, operator, dtype=None, device="cuda"
-    ) -> Generator[Tuple[Iterable[Any], Dict[str, Any]], None, None]:
-        assert (
-            str(operator) in self.operator_db
-        ), f"Could not find {operator}, must provide overload"
-
+        if self.op_name not in self.operator_db:
+            raise RuntimeError(f"Could not find {self.op_name} in {txt_file_path}.")
         if "embedding" in str(operator):
-            log.warning("Embedding inputs NYI, input data cannot be randomized")
-            yield
-            return
+            raise RuntimeError("Embedding inputs NYI, input data cannot be randomized")
 
-        # line[1] represents number of times these inputs occured, ignored for now
-        for line in self.operator_db[str(operator)].items():
-            inps = line[0]
+    def get_input_iter(
+        self,
+    ) -> Callable:
+        def _input_iter() -> Generator:
+            # line[1] represents number of times these inputs occured, ignored for now
+            for line in self.operator_db[self.op_name].items():
+                inps = line[0]
+                args, kwargs = deserialize_args(inps)
+                yield (
+                    args,
+                    kwargs,
+                )
 
-            args, kwargs = deserialize_args(inps)
-
-            # Backwards require some inputs to be float16 and some to be float32
-            # So we record on half and upcast to float when specified
-            if dtype and dtype != torch.float16:
-                to_dtype = partial(map_to_dtype, dtype=dtype)
-                args, kwargs = tree_map(to_dtype, (args, kwargs))
-
-            if device:
-                to_device = partial(map_to_device, device=torch.device(device))
-                args, kwargs = tree_map(to_device, (args, kwargs))
-
-            yield args, kwargs
+        return _input_iter
 
     def get_all_ops(self):
         for key in self.operator_db.keys():
             try:
                 op = eval(key)
             except AttributeError as ae:
-                log.warning("Evaluating an op name into an OpOverload: %s", ae)
+                logger.warning("Evaluating an op name into an OpOverload: %s", ae)
                 continue
             yield op
 
@@ -315,32 +232,9 @@ class OperatorInputsLoader:
             for inps, cnt in counter_dict.items():
                 self.operator_db[operator][inps] += cnt
 
-    @staticmethod
-    def get_timm_loader():
-        return OperatorInputsLoader._load_directory(TIMM_DIR)
 
-    @staticmethod
-    def get_huggingface_loader():
-        return OperatorInputsLoader._load_directory(HF_DIR)
-
-    @staticmethod
-    def get_torchbench_loader():
-        return OperatorInputsLoader._load_directory(TORCHBENCH_DIR)
-
-    @staticmethod
-    def _load_directory(inp_dir):
-        assert os.path.isdir(inp_dir), inp_dir
-        union = None
-        for inp in os.listdir(inp_dir):
-            if inp[-4:] != ".txt":
-                continue
-            path = os.path.join(inp_dir, inp)
-            if union is None:
-                union = OperatorInputsLoader(path)
-            else:
-                union.merge(OperatorInputsLoader(path))
-        return union
-
-
-def to_channels_last(ten):
-    return ten if ten.ndim != 4 else ten.to(memory_format=torch.channels_last)
+def get_input_iter(tritonbench_op: Any, op: str, input: str) -> Generator:
+    aten_op_name = tritonbench_op.aten_op_name
+    input_file_path = INPUT_CONFIG_DIR.joinpath(input)
+    operator_inputs_loader = OperatorInputsLoader(aten_op_name, input_file_path)
+    return operator_inputs_loader.get_input_iter()

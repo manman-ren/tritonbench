@@ -1,9 +1,10 @@
 import argparse
 import logging
 
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
+import torch._inductor.config as inductor_config
 import triton
 
 from tritonbench.utils.triton_op import (
@@ -36,9 +37,12 @@ except Exception as e:
 def parse_args(args):
     parser = argparse.ArgumentParser(description="TritonBench fp8_gemm")
     parser.add_argument("--llama", action="store_true")
+    parser.add_argument("--scaling_rowwise", action="store_true")
     parser.add_argument("--m", type=int)
     parser.add_argument("--k", type=int)
     parser.add_argument("--n", type=int)
+    parser.add_argument("--per-tensor-scale-a", type=float, default=None)
+    parser.add_argument("--per-tensor-scale-b", type=float, default=None)
     return parser.parse_args(args)
 
 
@@ -52,18 +56,77 @@ class Operator(BenchmarkOperator):
         super().__init__(tb_args, extra_args)
         self.extra_args = parse_args(extra_args)
 
+    def _get_dtype(self):
+        if self.extra_args.scaling_rowwise:
+            return torch.bfloat16
+        else:
+            return torch.float16
+
     def get_input_iter(self):
+        def _get_scale_per_tensor(
+            x: torch.Tensor, custom_scale: float = None
+        ) -> torch.Tensor:
+            # For tensor-wise scaling, kernel requires a float32 scale tensor
+            if custom_scale:
+                return torch.tensor(custom_scale, dtype=torch.float32, device=x.device)
+            scale = torch.finfo(torch.float8_e4m3fn).max / x.abs().max()
+            return scale.to(torch.float32)
+
+        def _get_scale_per_row(
+            x: torch.Tensor, transpose: bool = False
+        ) -> torch.Tensor:
+            if transpose:  # scale_b.shape should be [1, N]
+                scale = (
+                    torch.finfo(torch.float8_e4m3fn).max
+                    / x.abs().max(dim=0, keepdim=True).values
+                )
+            else:  # scale_a.shape should be [M, 1]
+                scale = (
+                    torch.finfo(torch.float8_e4m3fn).max
+                    / x.abs().max(dim=1, keepdim=True).values
+                )
+            return scale.to(
+                torch.float32
+            )  # For row-wise scaling, kernel requires a float32 scale tensor
+
         def args(m, n, k):
-            a = torch.randn(m, k, device=self.device).to(torch.float8_e4m3fn)
+            a = torch.randn(m, k, device=self.device).to(self._get_dtype())
             b = (
                 torch.randn(k, n, device=self.device)
-                .to(torch.float8_e4m3fn)
+                .to(self._get_dtype())
                 .T.contiguous()
                 .T
             )
-            return (a, b)
 
-        if self.extra_args.llama:
+            if self.extra_args.scaling_rowwise:
+                scale_a = _get_scale_per_row(a)
+                scale_b = _get_scale_per_row(b, transpose=True)
+            else:
+                scale_a = _get_scale_per_tensor(
+                    a, custom_scale=self.extra_args.per_tensor_scale_a
+                )
+                scale_b = _get_scale_per_tensor(
+                    b, custom_scale=self.extra_args.per_tensor_scale_b
+                )
+
+            # Kernels expect dtype=float8_e4m3fn
+            a = a.to(torch.float8_e4m3fn)
+            b = b.to(torch.float8_e4m3fn)
+
+            return (a, b, scale_a, scale_b)
+
+        if (
+            hasattr(self, "external_shapes") and self.external_shapes
+        ):  # Check for external shapes loaded from input-loader
+            for shape in self.external_shapes:
+                if len(shape) == 3:
+                    m, n, k = shape
+                    yield args(m, n, k)
+                else:
+                    logger.warning(
+                        f"Skipping invalid shape: {shape}, expected [M, N, K]"
+                    )
+        elif self.extra_args.llama:
             for m, n, k, _bias in llama_shapes():
                 yield args(m, n, k)
         elif self.extra_args.m:
@@ -77,29 +140,43 @@ class Operator(BenchmarkOperator):
                     yield args(m, n, k)
 
     def get_x_val(self, example_inputs) -> float:
-        a, b = example_inputs
+        a, b, _, _ = example_inputs
         m, k = a.size()
         _, n = b.size()
         return (m, n, k)
 
     @register_benchmark(baseline=True)
-    def torch_fp8_gemm(self, a, b):
-        scale_a = torch.tensor(1.0, device=a.device)
-        scale_b = torch.tensor(1.0, device=a.device)
+    def torch_fp8_gemm(self, a, b, scale_a, scale_b):
         return lambda: torch._scaled_mm(
-            a, b, scale_a, scale_b, use_fast_accum=True, out_dtype=torch.float16
+            a, b, scale_a, scale_b, use_fast_accum=True, out_dtype=self._get_dtype()
         )
 
     @register_benchmark()
-    def triton_fp8_gemm(self, a, b):
+    def pt2_fp8_gemm(self, a, b, scale_a, scale_b) -> Callable:
+        torch._dynamo.reset()
+        with inductor_config.patch(
+            max_autotune=True,
+            max_autotune_gemm_backends="TRITON",
+            autotune_fallback_to_aten=False,
+        ):
+            f = lambda a, b: torch._scaled_mm(
+                a, b, scale_a, scale_b, use_fast_accum=True, out_dtype=self._get_dtype()
+            )
+            compiled = torch.compile(f, dynamic=False)
+            compiled(a, b)
+
+        return lambda: compiled(a, b)
+
+    @register_benchmark()
+    def triton_fp8_gemm(self, a, b, scale_a, scale_b):
         return lambda: tutorial_matmul(a, b)
 
     @register_benchmark(enabled=HAS_TMA)
-    def triton_persistent_fp8_gemm(self, a, b):
+    def triton_persistent_fp8_gemm(self, a, b, scale_a, scale_b):
         return lambda: matmul_persistent(a, b)
 
     @register_benchmark(enabled=HAS_TMA)
-    def triton_tma_persistent_fp8_gemm(self, a, b):
+    def triton_tma_persistent_fp8_gemm(self, a, b, scale_a, scale_b):
         b = b.T.contiguous()
         c, desc_a, desc_b, desc_c = allocate_matmul_tma(a, b)
         return lambda: matmul_tma_persistent(a, b, c, desc_a, desc_b, desc_c)
@@ -109,7 +186,7 @@ class Operator(BenchmarkOperator):
         def nbytes(t):
             return t.numel() * t.element_size()
 
-        a, b = example_inputs
+        a, b, _, _ = example_inputs
         c = fn()
         c = c[0] if isinstance(c, tuple) else c
 
@@ -122,7 +199,7 @@ class Operator(BenchmarkOperator):
     def flops(
         self, fn_name: str, example_inputs: Any, metrics: BenchmarkOperatorMetrics
     ) -> float:
-        a, b = example_inputs
+        a, b, _, _ = example_inputs
         m, k = a.size()
         _, n = b.size()
         flops = 2 * m * n * k

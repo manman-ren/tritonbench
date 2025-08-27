@@ -37,7 +37,7 @@ on:
 
 jobs:
   linux-benchmark-h100:
-    if: github.repository_owner == 'pytorch-labs'
+    if: github.repository_owner == 'meta-pytorch'
     runs-on: [gcp-h100-runner]
     timeout-minutes: 240
     environment: docker-s3-upload
@@ -79,7 +79,7 @@ jobs:
           rm -rf .benchmarks || true
       - name: Compile Triton (Side B)
         run: |
-          bash ./.ci/triton/compile.sh --repo ${{ inputs.side_a_triton }} --commit ${{ inputs.side_a_commit }} --side b
+          bash ./.ci/triton/compile.sh --repo ${{ inputs.side_b_triton }} --commit ${{ inputs.side_b_commit }} --side b
       - name: Benchmark Triton (Side B)
         run: |
           bash ./.ci/tritonbench/run-benchmark.sh ${{ inputs.benchmark_name }} --conda-env triton-side-b

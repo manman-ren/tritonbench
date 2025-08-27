@@ -15,6 +15,13 @@ from tritonbench.utils.triton_op import (
     register_metric,
 )
 
+try:
+    from quack.softmax import softmax as quack_softmax
+
+    HAS_QUACK = True
+except ImportError:
+    HAS_QUACK = False
+
 
 class Operator(BenchmarkOperator):
     is_compute_bound = False
@@ -105,6 +112,11 @@ class Operator(BenchmarkOperator):
 
         return _inner
 
+    @register_benchmark(enabled=HAS_QUACK)
+    def quack(self, x):
+        inner = lambda: quack_softmax(x)
+        return inner
+
     def get_input_iter(self):
         M = 4096
         shapes = [(M, 128 * i) for i in range(2, 100)]
@@ -122,7 +134,7 @@ class Operator(BenchmarkOperator):
         return [shape[0], shape[1]]
 
     @register_metric()
-    def gbps(self, fn_name, example_inputs, metrics: BenchmarkOperatorMetrics) -> float:
+    def gbps(self, fn, example_inputs, metrics: BenchmarkOperatorMetrics) -> float:
         return (
             2
             * example_inputs[0].nelement()

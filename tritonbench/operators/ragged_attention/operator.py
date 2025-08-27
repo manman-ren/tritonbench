@@ -74,7 +74,7 @@ class Operator(BenchmarkOperator):
         self.alpha = 1.0 / self.attn_dim
         self.requires_grad = not (self.mode == Mode.FWD_NO_GRAD)
 
-    @register_benchmark()
+    @register_benchmark(baseline=True)
     def hstu(self, q, k, v, seq_offsets, num_targets, max_seq_len):
         return lambda: triton_hstu_mha(
             max_seq_len,
@@ -87,6 +87,7 @@ class Operator(BenchmarkOperator):
             max_attn_len=self.max_attn_len,
             contextual_seq_len=self.contextual_seq_len,
             sort_by_length=True,
+            enable_tma=True,
         )
 
     # TODO: remove B200 hacks like these.

@@ -20,14 +20,17 @@ import torch
 import triton
 import triton.language as tl
 
+from ..utils.triton_utils import AsyncTaskContext
+
 from .attention_utils import (
-    HAS_AUTO_WS,
+    HAS_EXPLICIT_WS,  # guard new tuning configs such as num_consumer_groups
     HAS_TMA_DESC,
     PEEL_LAST,
     TmaAutoTuneHelper,
     WITH_COMPPIPE,
     WITH_TMA,
 )
+
 
 if HAS_TMA_DESC:
     print(
@@ -39,6 +42,122 @@ else:
         "TMA benchmarks will be running without grid constant TMA descriptor.",
         file=sys.stderr,
     )
+
+
+@triton.jit
+def _attn_fwd_iteration(
+    q,
+    k,
+    offs_m,
+    start_n,
+    offs_n,
+    qk_scale,
+    l_i,
+    m_i,
+    acc,
+    v,
+    fp8_v: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    qk = tl.dot(q, k)
+    if STAGE == 2:
+        mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+        qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+    else:
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        qk = qk * qk_scale - m_ij[:, None]
+    p = tl.math.exp2(qk)
+    l_ij = tl.sum(p, 1)
+    # -- update m_i and l_i
+    alpha = tl.math.exp2(m_i - m_ij)
+    l_i = l_i * alpha + l_ij
+    # -- update output accumulator --
+    acc = acc * alpha[:, None]
+    # update acc
+    if fp8_v:
+        p = p.to(tl.float8e5)
+    else:
+        p = p.to(tl.bfloat16)
+    acc = tl.dot(p, v, acc)
+    # update m_i and l_i
+    m_i = m_ij
+    return l_i, m_i, acc
+
+
+@triton.jit
+def _attn_fwd_inner_autows(
+    acc,
+    l_i,
+    m_i,
+    q,  #
+    K_block_ptr,
+    V_block_ptr,  #
+    desc_k,
+    desc_v,
+    Q,
+    qvk_offset,
+    stride_kn,
+    stride_vn,
+    stride_vk,  #
+    start_m,
+    qk_scale,  #
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,  #
+    STAGE: tl.constexpr,
+    offs_m: tl.constexpr,
+    offs_n: tl.constexpr,  #
+    N_CTX: tl.constexpr,
+    fp8_v: tl.constexpr,
+    ENABLE_TMA: tl.constexpr,
+    LOOP_SCHEDULE: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+):
+    # range of values handled by this stage
+    if STAGE == 1:
+        lo, hi = 0, start_m * BLOCK_M
+    elif STAGE == 2:
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+    # causal = False
+    else:
+        lo, hi = 0, N_CTX
+    if not ENABLE_TMA:
+        K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+        V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    # loop over k, v and update accumulator
+    for start_n in tl.range(
+        lo, hi, BLOCK_N, warp_specialize=WARP_SPECIALIZE
+    ):  # , loop_schedule=LOOP_SCHEDULE):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        if ENABLE_TMA:
+            k = desc_k.load(
+                [start_n.to(tl.int32) + (qvk_offset // stride_kn).to(tl.int32), 0]
+            )
+        else:
+            k = tl.load(K_block_ptr)
+        if ENABLE_TMA:
+            k = tl.trans(k)
+        if ENABLE_TMA:
+            if fp8_v:
+                v = desc_v.load(
+                    [(qvk_offset // stride_vn).to(tl.int32), start_n.to(tl.int32)]
+                )
+                v = tl.trans(v)
+            else:
+                v = desc_v.load([(qvk_offset // stride_vk + start_n).to(tl.int32), 0])
+        else:
+            v = tl.load(V_block_ptr)
+        l_i, m_i, acc = _attn_fwd_iteration(
+            q, k, offs_m, start_n, offs_n, qk_scale, l_i, m_i, acc, v, fp8_v, STAGE
+        )
+        if not ENABLE_TMA:
+            V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+            K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+    return acc, l_i, m_i
 
 
 @triton.jit
@@ -82,7 +201,7 @@ def _attn_fwd_inner(
         K_block_ptr = tl.advance(K_block_ptr, (0, lo))
         V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
     # loop over k, v and update accumulator
-    for start_n in tl.range(lo, hi, BLOCK_N):  # , loop_schedule=LOOP_SCHEDULE):
+    for start_n in tl.range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         if ENABLE_TMA:
@@ -93,41 +212,19 @@ def _attn_fwd_inner(
             k = tl.load(K_block_ptr)
         if ENABLE_TMA:
             k = tl.trans(k)
-        qk = tl.dot(q, k)
-        if STAGE == 2:
-            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
-        else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, None]
-        p = tl.math.exp2(qk)
-        l_ij = tl.sum(p, 1)
-        # -- update m_i and l_i
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_i = l_i * alpha + l_ij
-        # -- update output accumulator --
-        acc = acc * alpha[:, None]
-        # update acc
         if ENABLE_TMA:
             if fp8_v:
                 v = desc_v.load(
                     [(qvk_offset // stride_vn).to(tl.int32), start_n.to(tl.int32)]
                 )
+                v = tl.trans(v)
             else:
                 v = desc_v.load([(qvk_offset // stride_vk + start_n).to(tl.int32), 0])
         else:
             v = tl.load(V_block_ptr)
-        if fp8_v:
-            if ENABLE_TMA:
-                v = tl.trans(v)
-            p = p.to(tl.float8e5)
-        else:
-            p = p.to(tl.bfloat16)
-        acc = tl.dot(p, v, acc)
-        # update m_i and l_i
-        m_i = m_ij
+        l_i, m_i, acc = _attn_fwd_iteration(
+            q, k, offs_m, start_n, offs_n, qk_scale, l_i, m_i, acc, v, fp8_v, STAGE
+        )
         if not ENABLE_TMA:
             V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
             K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
@@ -178,14 +275,14 @@ def _attn_fwd_inner_ws(
     for start_n in tl.range(lo, hi, BLOCK_N):  # , loop_schedule=LOOP_SCHEDULE):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
-        with tl.async_task([0]):
+        with AsyncTaskContext([0]):
             if ENABLE_TMA:
                 k = desc_k.load(
                     [start_n.to(tl.int32) + (qvk_offset // stride_kn).to(tl.int32), 0]
                 )
             else:
                 k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        with tl.async_task([1, 2]):
+        with AsyncTaskContext([1, 2]):
             if ENABLE_TMA:
                 k = tl.trans(k)
             qk = tl.dot(q, k)
@@ -205,7 +302,7 @@ def _attn_fwd_inner_ws(
             # -- update output accumulator --
             acc = acc * alpha[:, None]
             # update acc
-        with tl.async_task([0]):
+        with AsyncTaskContext([0]):
             if ENABLE_TMA:
                 if fp8_v:
                     v = desc_v.load(
@@ -217,7 +314,7 @@ def _attn_fwd_inner_ws(
                     )
             else:
                 v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
-        with tl.async_task([1, 2]):
+        with AsyncTaskContext([1, 2]):
             if fp8_v:
                 if ENABLE_TMA:
                     v = tl.trans(v)
@@ -233,143 +330,239 @@ def _attn_fwd_inner_ws(
     return acc, l_i, m_i
 
 
+@triton.jit
+def _attn_fwd_inner_ws_with_dp(
+    acc0,
+    acc1,
+    l_i0,
+    l_i1,
+    m_i0,
+    m_i1,
+    q0,  #
+    q1,
+    K_block_ptr,
+    V_block_ptr,  #
+    desc_k,
+    desc_v,
+    Q,
+    qvk_offset,
+    stride_kn,
+    stride_vn,
+    stride_vk,  #
+    start_m,
+    qk_scale,  #
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,  #
+    STAGE: tl.constexpr,
+    offs_m0: tl.constexpr,
+    offs_m1: tl.constexpr,
+    offs_n: tl.constexpr,  #
+    N_CTX: tl.constexpr,
+    fp8_v: tl.constexpr,
+    ENABLE_TMA: tl.constexpr,
+    LOOP_SCHEDULE: tl.constexpr,
+    FIRST_MMA: tl.constexpr,
+    LAST_MMA: tl.constexpr,
+    FIRST_SOFTMAX: tl.constexpr,
+    LAST_SOFTMAX: tl.constexpr,
+    LOAD_K: tl.constexpr,
+    LOAD_V: tl.constexpr,
+    FIRST_CORRECTION: tl.constexpr,
+    LAST_CORRECTION: tl.constexpr,
+    ALPHA_REMAT: tl.constexpr,
+):
+    # range of values handled by this stage
+    if STAGE == 1:
+        lo, hi = 0, start_m * BLOCK_M
+    elif STAGE == 2:
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+    # causal = False
+    else:
+        lo, hi = 0, N_CTX
+    if not ENABLE_TMA:
+        K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+        V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    # loop over k, v and update accumulator
+    for start_n in tl.range(lo, hi, BLOCK_N):  # , loop_schedule=LOOP_SCHEDULE):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        with AsyncTaskContext([LOAD_K]):
+            if ENABLE_TMA:
+                k = desc_k.load(
+                    [start_n.to(tl.int32) + (qvk_offset // stride_kn).to(tl.int32), 0]
+                )
+            else:
+                k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+
+        with AsyncTaskContext([FIRST_MMA]):
+            if ENABLE_TMA:  # feeds into gemm
+                k = tl.trans(k)
+            qk0 = tl.dot(q0, k)
+            qk1 = tl.dot(q1, k)
+        with AsyncTaskContext([FIRST_SOFTMAX]):
+            if STAGE == 2:
+                mask = offs_m0[:, None] >= (start_n + offs_n[None, :])
+                qk0 = qk0 * qk_scale + tl.where(mask, 0, -1.0e6)
+                m_ij0 = tl.maximum(m_i0, tl.max(qk0, 1))
+                qk0 -= m_ij0[:, None]
+            else:
+                m_ij0 = tl.maximum(m_i0, tl.max(qk0, 1) * qk_scale)
+                qk0 = qk0 * qk_scale - m_ij0[:, None]
+            p0 = tl.math.exp2(qk0)
+            l_ij0 = tl.sum(p0, 1)
+            # -- update m_i and l_i
+            alpha0 = tl.math.exp2(m_i0 - m_ij0)
+            l_i0 = l_i0 * alpha0 + l_ij0
+        with AsyncTaskContext([FIRST_CORRECTION]):
+            if ALPHA_REMAT:
+                alpha0_re = tl.math.exp2(m_i0 - m_ij0)
+                # -- update output accumulator --
+                acc0 = acc0 * alpha0_re[:, None]
+            else:
+                acc0 = acc0 * alpha0[:, None]
+        with AsyncTaskContext([FIRST_SOFTMAX]):
+            # update acc
+            if fp8_v:
+                p0 = p0.to(tl.float8e5)
+            else:
+                p0 = p0.to(tl.bfloat16)
+            # update m_i and l_i
+            m_i0 = m_ij0
+        with AsyncTaskContext([LAST_SOFTMAX]):
+            if STAGE == 2:
+                mask = offs_m1[:, None] >= (start_n + offs_n[None, :])
+                qk1 = qk1 * qk_scale + tl.where(mask, 0, -1.0e6)
+                m_ij1 = tl.maximum(m_i1, tl.max(qk1, 1))
+                qk1 -= m_ij1[:, None]
+            else:
+                m_ij1 = tl.maximum(m_i1, tl.max(qk1, 1) * qk_scale)
+                qk1 = qk1 * qk_scale - m_ij1[:, None]
+            p1 = tl.math.exp2(qk1)
+            l_ij1 = tl.sum(p1, 1)
+            # -- update m_i and l_i
+            alpha1 = tl.math.exp2(m_i1 - m_ij1)
+            l_i1 = l_i1 * alpha1 + l_ij1
+        with AsyncTaskContext([LAST_CORRECTION]):
+            if ALPHA_REMAT:
+                alpha1_re = tl.math.exp2(m_i1 - m_ij1)
+                # -- update output accumulator --
+                acc1 = acc1 * alpha1_re[:, None]
+            else:
+                acc1 = acc1 * alpha1[:, None]
+        with AsyncTaskContext([LAST_SOFTMAX]):
+            # update acc
+            if fp8_v:
+                p1 = p1.to(tl.float8e5)
+            else:
+                p1 = p1.to(tl.bfloat16)
+            # update m_i and l_i
+            m_i1 = m_ij1
+        with AsyncTaskContext([LOAD_V]):
+            if ENABLE_TMA:
+                if fp8_v:
+                    v = desc_v.load(
+                        [(qvk_offset // stride_vn).to(tl.int32), start_n.to(tl.int32)]
+                    )
+                else:
+                    v = desc_v.load(
+                        [(qvk_offset // stride_vk + start_n).to(tl.int32), 0]
+                    )
+            else:
+                v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+        with AsyncTaskContext([LAST_MMA]):
+            if fp8_v:
+                if ENABLE_TMA:
+                    v = tl.trans(v)
+            acc0 = tl.dot(p0, v, acc0)
+            acc1 = tl.dot(p1, v, acc1)
+        if not ENABLE_TMA:
+            V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+            K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+    return acc0, acc1, l_i0, l_i1, m_i0, m_i1
+
+
 # We don't run auto-tuning every time to keep the tutorial fast. Uncommenting
 # the code below and commenting out the equivalent parameters is convenient for
 # re-tuning.
 HAS_NEW_TMA = hasattr(triton, "set_allocator") and hasattr(tl, "make_tensor_descriptor")
+
+# This part is for computation pipelining
 schedList = ["default", "FA_firstDot", "FA_secondDot"] if WITH_COMPPIPE else ["default"]
 # TODO: incorrect result with PEEL_LAST + FA_firstDot + WarpSpec + TMA
 schedList = ["FA_secondDot"] if PEEL_LAST else schedList
+
 tmaList = [True] if WITH_TMA and HAS_NEW_TMA else [False]
-# no WS, no TMA, with CompPipe
-configsOpt = [
-    (
-        triton.Config(
-            {
-                "BLOCK_M": BM,
-                "BLOCK_N": BN,
-                "ENABLE_TMA": enable_tma,
-                "LOOP_SCHEDULE": sched,
-            },
-            num_stages=4 if sched == "FA_firstDot" or sched == "FA_secondDot" else 3,
-            num_warps=w,
-            num_buffers_warp_spec=0,
-            num_consumer_groups=0,
-        )
-        if HAS_AUTO_WS == "1"
-        else triton.Config(
-            {
-                "BLOCK_M": BM,
-                "BLOCK_N": BN,
-                "ENABLE_TMA": enable_tma,
-                "LOOP_SCHEDULE": sched,
-            },
-            num_stages=4 if sched == "FA_firstDot" or sched == "FA_secondDot" else 3,
-            num_warps=w,
-        )
-    )
-    for BM in [64, 128]
-    for BN in [64, 128]
-    for sched in schedList
-    for enable_tma in [False]
-    for w in [4, 8]
-]
-# no WS, with TMA and CompPipe
-configsTma = [
-    (
-        triton.Config(
-            {
-                "BLOCK_M": BM,
-                "BLOCK_N": BN,
-                "ENABLE_TMA": enable_tma,
-                "LOOP_SCHEDULE": sched,
-            },
-            num_stages=4 if sched == "FA_firstDot" or sched == "FA_secondDot" else 3,
-            num_warps=w,
-            num_buffers_warp_spec=0,
-            num_consumer_groups=0,
-        )
-        if HAS_AUTO_WS == "1"
-        else triton.Config(
-            {
-                "BLOCK_M": BM,
-                "BLOCK_N": BN,
-                "ENABLE_TMA": enable_tma,
-                "LOOP_SCHEDULE": sched,
-            },
-            num_stages=4 if sched == "FA_firstDot" or sched == "FA_secondDot" else 3,
-            num_warps=w,
-        )
-    )
-    for BM in [64, 128]
-    for BN in [64, 128]
-    for sched in schedList
-    for enable_tma in [True]
-    for w in [4, 8]
-]
-# no TMA, with WS and CompPipe
-configsWS = [
-    (
-        triton.Config(
-            {"BLOCK_M": BM, "BLOCK_N": BN, "ENABLE_TMA": False, "LOOP_SCHEDULE": sched},
-            num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
-            num_warps=w,
-            num_buffers_warp_spec=buf,
-            num_consumer_groups=grp,
-            reg_dec_producer=dec,
-            reg_inc_consumer=inc,
-        )
-        if HAS_AUTO_WS == "1"
-        else triton.Config(
-            {"BLOCK_M": BM, "BLOCK_N": BN, "ENABLE_TMA": False, "LOOP_SCHEDULE": sched},
-            num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
-            num_warps=w,
-        )
-    )
-    for BM in [64, 128]
-    for BN in [64, 128]
-    for sched in schedList
-    for enable_ws in [True]
-    for w in [4, 8]
-    for buf in [2]
-    for grp in [2]
-    for dec, inc in [
-        (24, 240)
-    ]  # (24, 240), (40, 232)]  # 32,240 hangs, 24, 240 works 40, 232 works
-]
+
+
+def get_fwd_config_space(
+    persistent: bool, enable_ws: bool, support_explicit_ws: bool, enable_tma: bool
+):
+    configs = []
+    bmList = [128] if enable_ws else [64, 128]
+    bnList = [64, 128]  # To handle hDim of 64, we need BLOCK_N to be <= 64
+    wList = [4] if enable_ws else [4, 8]
+    stageList = [2] if enable_ws else [3, 4, 7]
+    for BM in bmList:
+        for BN in bnList:
+            for sched in schedList:  # set in global scope
+                for w in wList:
+                    for stage in stageList:
+                        base_config_dict = {
+                            "BLOCK_M": BM,
+                            "BLOCK_N": BN,
+                            "ENABLE_TMA": enable_tma,
+                            "LOOP_SCHEDULE": sched,
+                        }
+                        config_dicts = []
+                        if persistent:
+                            config_dicts.append(
+                                {
+                                    **base_config_dict,
+                                    "GRID_MULTIPLE": 1,  # This can be set to multiple values
+                                }
+                            )
+                        else:
+                            config_dicts.append(base_config_dict)
+                        for config_dict in config_dicts:
+                            if support_explicit_ws:
+                                if enable_ws:
+                                    configs.append(
+                                        triton.Config(
+                                            config_dict,
+                                            num_warps=w,
+                                            num_stages=stage,
+                                            num_buffers_warp_spec=2,
+                                            num_consumer_groups=2,
+                                            reg_dec_producer=24,
+                                            reg_inc_consumer=240,
+                                        )
+                                    )
+                                else:
+                                    configs.append(
+                                        triton.Config(
+                                            config_dict,
+                                            num_warps=w,
+                                            num_stages=stage,
+                                            num_buffers_warp_spec=0,
+                                            num_consumer_groups=0,
+                                        )
+                                    )
+                            else:
+                                configs.append(
+                                    triton.Config(
+                                        config_dict,
+                                        num_warps=w,
+                                        num_stages=stage,
+                                    )
+                                )
+    return configs
+
+
 # BLOCK_M: 128, BLOCK_N: 128, ENABLE_TMA: False, LOOP_SCHEDULE: default, num_warps: 8, num_ctas: 1, num_stages: 3
 if torch.version.hip is None:
-    configsOrig = [
-        (
-            triton.Config(
-                {
-                    "BLOCK_M": BM,
-                    "BLOCK_N": BN,
-                    "ENABLE_TMA": False,
-                    "LOOP_SCHEDULE": "default",
-                },
-                num_stages=s,
-                num_warps=w,
-                num_buffers_warp_spec=0,
-                num_consumer_groups=0,
-            )
-            if HAS_AUTO_WS == "1"
-            else triton.Config(
-                {
-                    "BLOCK_M": BM,
-                    "BLOCK_N": BN,
-                    "ENABLE_TMA": False,
-                    "LOOP_SCHEDULE": "default",
-                },
-                num_stages=s,
-                num_warps=w,
-            )
-        )
-        for BM in [64, 128]
-        for BN in [64, 128]
-        for s in ([3, 4, 7])
-        for w in [4, 8]
-    ]
+    configsOrig = get_fwd_config_space(False, False, HAS_EXPLICIT_WS, False)
 else:
     configsOrig = [
         (
@@ -392,90 +585,19 @@ else:
         for w in [1, 2, 4, 8]
         for wpe in [0, 1, 2, 3, 4]
     ]
+# no WS, no TMA, with CompPipe
+configsOpt = get_fwd_config_space(False, False, HAS_EXPLICIT_WS, False)
+# no WS, with TMA and CompPipe
+configsTma = get_fwd_config_space(False, False, HAS_EXPLICIT_WS, True)
+# no TMA, with WS and CompPipe
+configsWS = get_fwd_config_space(False, True, HAS_EXPLICIT_WS, False)
 # TMA, WS, and CompPipe
-configsTmaWS = [
-    (
-        triton.Config(
-            {
-                "BLOCK_M": BM,
-                "BLOCK_N": BN,
-                "ENABLE_TMA": enable_tma,
-                "LOOP_SCHEDULE": sched,
-            },
-            num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
-            num_warps=w,
-            num_buffers_warp_spec=buf,
-            num_consumer_groups=grp,
-            reg_dec_producer=dec,
-            reg_inc_consumer=inc,
-        )
-        if HAS_AUTO_WS == "1"
-        else triton.Config(
-            {
-                "BLOCK_M": BM,
-                "BLOCK_N": BN,
-                "ENABLE_TMA": enable_tma,
-                "LOOP_SCHEDULE": sched,
-            },
-            num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
-            num_warps=w,
-        )
-    )
-    for BM in [128]
-    for BN in [128]
-    for sched in schedList
-    for enable_tma in tmaList
-    for enable_ws in [True]
-    for w in [4]
-    for buf in [2]
-    for grp in [2]  # 2
-    for dec, inc in [
-        (24, 240)
-    ]  # , (40, 232)] #32,240 hangs, 24, 240 works 40, 232 works
-]
-configsTmaWSPersistent = [
-    (
-        triton.Config(
-            {
-                "BLOCK_M": BM,
-                "BLOCK_N": BN,
-                "ENABLE_TMA": enable_tma,
-                "LOOP_SCHEDULE": sched,
-                "GRID_MULTIPLE": mult,
-            },
-            num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
-            num_warps=w,
-            num_buffers_warp_spec=buf,
-            num_consumer_groups=grp,
-            reg_dec_producer=dec,
-            reg_inc_consumer=inc,
-        )
-        if HAS_AUTO_WS == "1"
-        else triton.Config(
-            {
-                "BLOCK_M": BM,
-                "BLOCK_N": BN,
-                "ENABLE_TMA": enable_tma,
-                "LOOP_SCHEDULE": sched,
-                "GRID_MULTIPLE": mult,
-            },
-            num_stages=2 if sched == "FA_firstDot" or sched == "FA_secondDot" else 0,
-            num_warps=w,
-        )
-    )
-    for BM in [128]
-    for BN in [128]
-    for mult in [1]
-    for sched in schedList
-    for enable_tma in tmaList
-    for enable_ws in [True]
-    for w in [4]
-    for buf in [2]
-    for grp in [2]  # 2
-    for dec, inc in [
-        (24, 240)
-    ]  # , (40, 232)] #32,240 hangs, 24, 240 works 40, 232 works
-]
+configsTmaWS = get_fwd_config_space(
+    False, True, HAS_EXPLICIT_WS, WITH_TMA and HAS_NEW_TMA
+)
+configsTmaWSPersistent = get_fwd_config_space(
+    True, True, HAS_EXPLICIT_WS, WITH_TMA and HAS_NEW_TMA
+)
 
 
 def keep(conf):
@@ -525,6 +647,7 @@ def _attn_fwd_compute(
     STAGE: tl.constexpr,  #
     ENABLE_TMA: tl.constexpr,
     LOOP_SCHEDULE: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -590,64 +713,125 @@ def _attn_fwd_compute(
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner(
-            acc,
-            l_i,
-            m_i,
-            q,
-            K_block_ptr,
-            V_block_ptr,  #
-            desc_k,
-            desc_v,
-            Q,
-            qvk_offset,
-            stride_kn,
-            stride_vn,
-            stride_vk,  #
-            start_m,
-            qk_scale,  #
-            BLOCK_M,
-            HEAD_DIM,
-            BLOCK_N,  #
-            4 - STAGE,
-            offs_m,
-            offs_n,
-            N_CTX,
-            V.dtype.element_ty == tl.float8e5,  #
-            ENABLE_TMA,
-            LOOP_SCHEDULE,
-        )
+        if WARP_SPECIALIZE:
+            acc, l_i, m_i = _attn_fwd_inner_autows(
+                acc,
+                l_i,
+                m_i,
+                q,
+                K_block_ptr,
+                V_block_ptr,  #
+                desc_k,
+                desc_v,
+                Q,
+                qvk_offset,
+                stride_kn,
+                stride_vn,
+                stride_vk,  #
+                start_m,
+                qk_scale,  #
+                BLOCK_M,
+                HEAD_DIM,
+                BLOCK_N,  #
+                4 - STAGE,
+                offs_m,
+                offs_n,
+                N_CTX,
+                V.dtype.element_ty == tl.float8e5,  #
+                ENABLE_TMA,
+                LOOP_SCHEDULE,
+                WARP_SPECIALIZE,
+            )
+        else:
+            acc, l_i, m_i = _attn_fwd_inner(
+                acc,
+                l_i,
+                m_i,
+                q,
+                K_block_ptr,
+                V_block_ptr,  #
+                desc_k,
+                desc_v,
+                Q,
+                qvk_offset,
+                stride_kn,
+                stride_vn,
+                stride_vk,  #
+                start_m,
+                qk_scale,  #
+                BLOCK_M,
+                HEAD_DIM,
+                BLOCK_N,  #
+                4 - STAGE,
+                offs_m,
+                offs_n,
+                N_CTX,
+                V.dtype.element_ty == tl.float8e5,  #
+                ENABLE_TMA,
+                LOOP_SCHEDULE,
+            )
+
     # stage 2: on-band
     if STAGE & 2:
         # barrier makes it easier for compielr to schedule the
         # two loops independently
-        acc, l_i, m_i = _attn_fwd_inner(
-            acc,
-            l_i,
-            m_i,
-            q,
-            K_block_ptr,
-            V_block_ptr,  #
-            desc_k,
-            desc_v,
-            Q,
-            qvk_offset,
-            stride_kn,
-            stride_vn,
-            stride_vk,  #
-            start_m,
-            qk_scale,  #
-            BLOCK_M,
-            HEAD_DIM,
-            BLOCK_N,  #
-            2,
-            offs_m,
-            offs_n,
-            N_CTX,
-            V.dtype.element_ty == tl.float8e5,  #
-            ENABLE_TMA,
-            LOOP_SCHEDULE,
-        )
+        if WARP_SPECIALIZE:
+            acc, l_i, m_i = _attn_fwd_inner_autows(
+                acc,
+                l_i,
+                m_i,
+                q,
+                K_block_ptr,
+                V_block_ptr,  #
+                desc_k,
+                desc_v,
+                Q,
+                qvk_offset,
+                stride_kn,
+                stride_vn,
+                stride_vk,  #
+                start_m,
+                qk_scale,  #
+                BLOCK_M,
+                HEAD_DIM,
+                BLOCK_N,  #
+                2,
+                offs_m,
+                offs_n,
+                N_CTX,
+                V.dtype.element_ty == tl.float8e5,  #
+                ENABLE_TMA,
+                LOOP_SCHEDULE,
+                WARP_SPECIALIZE,
+            )
+        else:
+            acc, l_i, m_i = _attn_fwd_inner(
+                acc,
+                l_i,
+                m_i,
+                q,
+                K_block_ptr,
+                V_block_ptr,  #
+                desc_k,
+                desc_v,
+                Q,
+                qvk_offset,
+                stride_kn,
+                stride_vn,
+                stride_vk,  #
+                start_m,
+                qk_scale,  #
+                BLOCK_M,
+                HEAD_DIM,
+                BLOCK_N,  #
+                2,
+                offs_m,
+                offs_n,
+                N_CTX,
+                V.dtype.element_ty == tl.float8e5,  #
+                ENABLE_TMA,
+                LOOP_SCHEDULE,
+            )
     # epilogue
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
@@ -759,7 +943,7 @@ def _attn_fwd_compute_ws(
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
-    with tl.async_task([0]):
+    with AsyncTaskContext([0]):
         if ENABLE_TMA:
             q = desc_q.load(
                 [(qvk_offset // stride_qm + start_m * BLOCK_M).to(tl.int32), 0]
@@ -829,7 +1013,7 @@ def _attn_fwd_compute_ws(
             LOOP_SCHEDULE,
         )
     # epilogue
-    with tl.async_task([1, 2]):
+    with AsyncTaskContext([1, 2]):
         m_i += tl.math.log2(l_i)
         acc = acc / l_i[:, None]
         m_ptrs = M + off_hz * N_CTX + offs_m
@@ -838,6 +1022,226 @@ def _attn_fwd_compute_ws(
             desc_o.store(
                 [(qvk_offset // stride_om + start_m * BLOCK_M).to(tl.int32), 0],
                 acc.to(Out.type.element_ty),
+            )
+        else:
+            tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+
+
+# only supports TMA, and explicit async_task
+@triton.jit
+def _attn_fwd_compute_ws_with_dp(
+    Q,
+    K,
+    V,
+    sm_scale,
+    M,
+    Out,  #
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,  #
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,  #
+    stride_vz,
+    stride_vh,
+    stride_vk,
+    stride_vn,  #
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_on,  #
+    off_hz,
+    pid,
+    Z,
+    H,
+    N_CTX,  #: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_M_HALF: tl.constexpr,
+    BLOCK_N: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,  #
+    STAGE: tl.constexpr,  #
+    ENABLE_TMA: tl.constexpr,
+    LOOP_SCHEDULE: tl.constexpr,
+    FIRST_MMA: tl.constexpr,
+    LAST_MMA: tl.constexpr,
+    FIRST_SOFTMAX: tl.constexpr,
+    LAST_SOFTMAX: tl.constexpr,
+    LOAD_K: tl.constexpr,
+    LOAD_V: tl.constexpr,
+    FIRST_CORRECTION: tl.constexpr,
+    LAST_CORRECTION: tl.constexpr,
+    ALPHA_REMAT: tl.constexpr,
+    FIRST_LOADQ: tl.constexpr,
+    LAST_LOADQ: tl.constexpr,
+):
+    start_m = pid  # tl.program_id(0)
+    # off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+
+    K_block_ptr = None
+    V_block_ptr = None
+    Q_block_ptr = None
+    O_block_ptr = None
+    # initialize offsets
+    offs_m0 = start_m * BLOCK_M + tl.arange(0, BLOCK_M_HALF)
+    offs_m1 = start_m * BLOCK_M + BLOCK_M_HALF + tl.arange(0, BLOCK_M_HALF)
+    offs_n = tl.arange(0, BLOCK_N)
+    # initialize pointer to m and l
+    m_i0 = tl.zeros([BLOCK_M_HALF], dtype=tl.float32) - float("inf")
+    l_i0 = tl.zeros([BLOCK_M_HALF], dtype=tl.float32) + 1.0
+    acc0 = tl.zeros([BLOCK_M_HALF, HEAD_DIM], dtype=tl.float32)
+    m_i1 = tl.zeros([BLOCK_M_HALF], dtype=tl.float32) - float("inf")
+    l_i1 = tl.zeros([BLOCK_M_HALF], dtype=tl.float32) + 1.0
+    acc1 = tl.zeros([BLOCK_M_HALF, HEAD_DIM], dtype=tl.float32)
+    # load scales
+    qk_scale = sm_scale
+    qk_scale *= 1.44269504  # 1/log(2)
+    # load q: it will stay in SRAM throughout
+    # q0 will be BLOCK_M, each kernel invocation will handle 2 * BLOCK_M
+    with AsyncTaskContext([FIRST_LOADQ]):
+        if ENABLE_TMA:
+            q0 = desc_q.load(
+                [(qvk_offset // stride_qm + start_m * BLOCK_M).to(tl.int32), 0]
+            )
+        else:
+            q0 = tl.load(Q_block_ptr)
+    with AsyncTaskContext([LAST_LOADQ]):
+        if ENABLE_TMA:
+            q1 = desc_q.load(
+                [
+                    (qvk_offset // stride_qm + start_m * BLOCK_M + BLOCK_M_HALF).to(
+                        tl.int32
+                    ),
+                    0,
+                ]
+            )
+        else:
+            q1 = tl.load(Q_block_ptr)
+    # stage 1: off-band
+    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
+    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
+    if STAGE & 1:
+        acc0, acc1, l_i0, l_i1, m_i0, m_i1 = _attn_fwd_inner_ws_with_dp(
+            acc0,
+            acc1,
+            l_i0,
+            l_i1,
+            m_i0,
+            m_i1,
+            q0,
+            q1,
+            K_block_ptr,
+            V_block_ptr,  #
+            desc_k,
+            desc_v,
+            Q,
+            qvk_offset,
+            stride_kn,
+            stride_vn,
+            stride_vk,  #
+            start_m,
+            qk_scale,  #
+            BLOCK_M,
+            HEAD_DIM,
+            BLOCK_N,  #
+            4 - STAGE,
+            offs_m0,
+            offs_m1,
+            offs_n,
+            N_CTX,
+            V.dtype.element_ty == tl.float8e5,  #
+            ENABLE_TMA,
+            LOOP_SCHEDULE,
+            FIRST_MMA,
+            LAST_MMA,
+            FIRST_SOFTMAX,
+            LAST_SOFTMAX,
+            LOAD_K,
+            LOAD_V,
+            FIRST_CORRECTION,
+            LAST_CORRECTION,
+            ALPHA_REMAT,
+        )
+    # stage 2: on-band
+    if STAGE & 2:
+        # barrier makes it easier for compielr to schedule the
+        # two loops independently
+        acc, l_i, m_i = _attn_fwd_inner_ws_with_dp(
+            acc0,
+            acc1,
+            l_i0,
+            l_i1,
+            m_i0,
+            m_i1,
+            q0,
+            q1,
+            K_block_ptr,
+            V_block_ptr,  #
+            desc_k,
+            desc_v,
+            Q,
+            qvk_offset,
+            stride_kn,
+            stride_vn,
+            stride_vk,  #
+            start_m,
+            qk_scale,  #
+            BLOCK_M,
+            HEAD_DIM,
+            BLOCK_N,  #
+            2,
+            offs_m0,
+            offs_m1,
+            offs_n,
+            N_CTX,
+            V.dtype.element_ty == tl.float8e5,  #
+            ENABLE_TMA,
+            LOOP_SCHEDULE,
+            FIRST_MMA,
+            LAST_MMA,
+            FIRST_SOFTMAX,
+            LAST_SOFTMAX,
+            LOAD_K,
+            LOAD_V,
+            FIRST_CORRECTION,
+            LAST_CORRECTION,
+            ALPHA_REMAT,
+        )
+    # epilogue
+    with AsyncTaskContext([FIRST_SOFTMAX]):
+        m_i0 += tl.math.log2(l_i0)
+        acc0 = acc0 / l_i0[:, None]
+        m_ptrs0 = M + off_hz * N_CTX + offs_m0
+        tl.store(m_ptrs0, m_i0)
+        if ENABLE_TMA:
+            desc_o.store(
+                [(qvk_offset // stride_om + start_m * BLOCK_M).to(tl.int32), 0],
+                acc0.to(Out.type.element_ty),
+            )
+        else:
+            tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+    with AsyncTaskContext([LAST_SOFTMAX]):
+        m_i1 += tl.math.log2(l_i1)
+        acc1 = acc1 / l_i1[:, None]
+        m_ptrs1 = M + off_hz * N_CTX + offs_m1
+        tl.store(m_ptrs1, m_i1)
+        if ENABLE_TMA:
+            desc_o.store(
+                [
+                    (qvk_offset // stride_om + start_m * BLOCK_M + BLOCK_M_HALF).to(
+                        tl.int32
+                    ),
+                    0,
+                ],
+                acc1.to(Out.type.element_ty),
             )
         else:
             tl.store(O_block_ptr, acc.to(Out.type.element_ty))
@@ -882,49 +1286,92 @@ def _attn_fwd_ws(
     ENABLE_TMA: tl.constexpr,
     LOOP_SCHEDULE: tl.constexpr,
     ENABLE_WS: tl.constexpr,
+    HAS_EXPLICIT_WS: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
-    _attn_fwd_compute_ws(
-        Q,
-        K,
-        V,
-        sm_scale,
-        M,
-        Out,  #
-        desc_q,
-        desc_k,
-        desc_v,
-        desc_o,
-        stride_qz,
-        stride_qh,
-        stride_qm,
-        stride_qk,  #
-        stride_kz,
-        stride_kh,
-        stride_kn,
-        stride_kk,  #
-        stride_vz,
-        stride_vh,
-        stride_vk,
-        stride_vn,  #
-        stride_oz,
-        stride_oh,
-        stride_om,
-        stride_on,  #
-        off_hz,
-        pid,
-        Z,
-        H,
-        N_CTX,  #: tl.constexpr,  #
-        BLOCK_M,
-        BLOCK_N,
-        HEAD_DIM,
-        STAGE,
-        ENABLE_TMA,
-        LOOP_SCHEDULE,
-    )
+    if HAS_EXPLICIT_WS:
+        _attn_fwd_compute_ws(
+            Q,
+            K,
+            V,
+            sm_scale,
+            M,
+            Out,  #
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,  #
+            stride_kz,
+            stride_kh,
+            stride_kn,
+            stride_kk,  #
+            stride_vz,
+            stride_vh,
+            stride_vk,
+            stride_vn,  #
+            stride_oz,
+            stride_oh,
+            stride_om,
+            stride_on,  #
+            off_hz,
+            pid,
+            Z,
+            H,
+            N_CTX,  #: tl.constexpr,  #
+            BLOCK_M,
+            BLOCK_N,
+            HEAD_DIM,
+            STAGE,
+            ENABLE_TMA,
+            LOOP_SCHEDULE,
+        )
+    else:
+        _attn_fwd_compute(
+            Q,
+            K,
+            V,
+            sm_scale,
+            M,
+            Out,  #
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,  #
+            stride_kz,
+            stride_kh,
+            stride_kn,
+            stride_kk,  #
+            stride_vz,
+            stride_vh,
+            stride_vk,
+            stride_vn,  #
+            stride_oz,
+            stride_oh,
+            stride_om,
+            stride_on,  #
+            off_hz,
+            pid,
+            Z,
+            H,
+            N_CTX,  #: tl.constexpr,  #
+            BLOCK_M,
+            BLOCK_N,
+            HEAD_DIM,
+            STAGE,
+            ENABLE_TMA,
+            LOOP_SCHEDULE,
+            False,  # warp_specialize on hopper is not ready yet
+        )
 
 
 @triton.autotune(list(filter(keep, configsOrig + configsOpt)), key=["N_CTX"])
@@ -987,7 +1434,7 @@ def _attn_fwd_base_opt(
     tl.assume(H >= 0)
 
     tl.static_assert(BLOCK_N <= HEAD_DIM)
-    pid = tl.program_id(0)
+    start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
 
     # Both base and opt use the same compute function
@@ -1019,7 +1466,7 @@ def _attn_fwd_base_opt(
         stride_om,
         stride_on,
         off_hz,
-        pid,
+        start_m,
         Z,
         H,
         N_CTX,
@@ -1029,10 +1476,25 @@ def _attn_fwd_base_opt(
         STAGE,
         ENABLE_TMA,
         LOOP_SCHEDULE,
+        False,  # WARP_SPECIALIZE
     )
 
 
-@triton.autotune(list(filter(keep, configsTma + configsTmaWS)), key=["N_CTX"])
+def prune_invalid_configs(configs, named_args, **kwargs):
+    ENABLE_WS = kwargs["ENABLE_WS"]
+    # Choose configsTmaWS when ENABLE_WS is True
+    if ENABLE_WS:
+        return [conf for conf in configs if conf in configsTmaWS]
+    return [conf for conf in configs if conf in configsTma]
+
+
+# when ENABLE_WS is true, we can't use configsTma
+# use either configsTma or configsTmaWS, not configsTma + configsTmaWS
+@triton.autotune(
+    list(filter(keep, configsTma + configsTmaWS)),
+    key=["N_CTX"],
+    prune_configs_by={"early_config_prune": prune_invalid_configs},
+)
 @triton.jit
 def _attn_fwd_tma_unified(
     Q,
@@ -1067,6 +1529,7 @@ def _attn_fwd_tma_unified(
     ENABLE_TMA: tl.constexpr,
     LOOP_SCHEDULE: tl.constexpr,
     ENABLE_WS: tl.constexpr,
+    HAS_EXPLICIT_WS: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     pid = tl.program_id(0)
@@ -1115,45 +1578,87 @@ def _attn_fwd_tma_unified(
 
     # Call appropriate compute function based on ENABLE_WS
     if ENABLE_WS:
-        _attn_fwd_compute_ws(
-            Q,
-            K,
-            V,
-            sm_scale,
-            M,
-            Out,
-            desc_q,
-            desc_k,
-            desc_v,
-            desc_o,
-            stride_qz,
-            stride_qh,
-            stride_qm,
-            stride_qk,
-            stride_kz,
-            stride_kh,
-            stride_kn,
-            stride_kk,
-            stride_vz,
-            stride_vh,
-            stride_vk,
-            stride_vn,
-            stride_oz,
-            stride_oh,
-            stride_om,
-            stride_on,
-            off_hz,
-            pid,
-            Z,
-            H,
-            N_CTX,
-            BLOCK_M,
-            BLOCK_N,
-            HEAD_DIM,
-            STAGE,
-            ENABLE_TMA,
-            LOOP_SCHEDULE,
-        )
+        if HAS_EXPLICIT_WS:
+            _attn_fwd_compute_ws(
+                Q,
+                K,
+                V,
+                sm_scale,
+                M,
+                Out,
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                stride_qz,
+                stride_qh,
+                stride_qm,
+                stride_qk,
+                stride_kz,
+                stride_kh,
+                stride_kn,
+                stride_kk,
+                stride_vz,
+                stride_vh,
+                stride_vk,
+                stride_vn,
+                stride_oz,
+                stride_oh,
+                stride_om,
+                stride_on,
+                off_hz,
+                pid,
+                Z,
+                H,
+                N_CTX,
+                BLOCK_M,
+                BLOCK_N,
+                HEAD_DIM,
+                STAGE,
+                ENABLE_TMA,
+                LOOP_SCHEDULE,
+            )
+        else:
+            _attn_fwd_compute(
+                Q,
+                K,
+                V,
+                sm_scale,
+                M,
+                Out,
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                stride_qz,
+                stride_qh,
+                stride_qm,
+                stride_qk,
+                stride_kz,
+                stride_kh,
+                stride_kn,
+                stride_kk,
+                stride_vz,
+                stride_vh,
+                stride_vk,
+                stride_vn,
+                stride_oz,
+                stride_oh,
+                stride_om,
+                stride_on,
+                off_hz,
+                pid,
+                Z,
+                H,
+                N_CTX,
+                BLOCK_M,
+                BLOCK_N,
+                HEAD_DIM,
+                STAGE,
+                ENABLE_TMA,
+                LOOP_SCHEDULE,
+                False,  # warp_specialize on hopper is not ready yet
+            )
     else:
         _attn_fwd_compute(
             Q,
@@ -1193,6 +1698,7 @@ def _attn_fwd_tma_unified(
             STAGE,
             ENABLE_TMA,
             LOOP_SCHEDULE,
+            False,  # WARP_SPECIALIZE
         )
 
 
@@ -1232,6 +1738,7 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
     LOOP_SCHEDULE: tl.constexpr,
     ENABLE_WS: tl.constexpr,
     GRID_MULTIPLE: tl.constexpr,
+    HAS_EXPLICIT_WS: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     # original grid
@@ -1247,6 +1754,12 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
         tiles_per_sm += 1
 
     tile_idx = prog_id
+
+    # Initialize descriptors as None
+    desc_q = None
+    desc_k = None
+    desc_v = None
+    desc_o = None
 
     if ENABLE_TMA:
         desc_k = tl.make_tensor_descriptor(
@@ -1289,7 +1802,269 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
         #     off_hz = tile_idx % (Z * H)  # tl.program_id(1)
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
-        _attn_fwd_compute_ws(
+        if HAS_EXPLICIT_WS:
+            _attn_fwd_compute_ws(
+                Q,
+                K,
+                V,
+                sm_scale,
+                M,
+                Out,  #
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                stride_qz,
+                stride_qh,
+                stride_qm,
+                stride_qk,  #
+                stride_kz,
+                stride_kh,
+                stride_kn,
+                stride_kk,  #
+                stride_vz,
+                stride_vh,
+                stride_vk,
+                stride_vn,  #
+                stride_oz,
+                stride_oh,
+                stride_om,
+                stride_on,  #
+                off_hz,
+                pid,
+                Z,
+                H,
+                N_CTX,  #: tl.constexpr,  #
+                BLOCK_M,
+                BLOCK_N,
+                HEAD_DIM,
+                STAGE,
+                ENABLE_TMA,
+                LOOP_SCHEDULE,
+            )
+        else:
+            _attn_fwd_compute(
+                Q,
+                K,
+                V,
+                sm_scale,
+                M,
+                Out,  #
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                stride_qz,
+                stride_qh,
+                stride_qm,
+                stride_qk,  #
+                stride_kz,
+                stride_kh,
+                stride_kn,
+                stride_kk,  #
+                stride_vz,
+                stride_vh,
+                stride_vk,
+                stride_vn,  #
+                stride_oz,
+                stride_oh,
+                stride_om,
+                stride_on,  #
+                off_hz,
+                pid,
+                Z,
+                H,
+                N_CTX,  #: tl.constexpr,  #
+                BLOCK_M,
+                BLOCK_N,
+                HEAD_DIM,
+                STAGE,
+                ENABLE_TMA,
+                LOOP_SCHEDULE,
+                False,  # warp_specialize on hopper is not ready yet
+            )
+        tile_idx += num_progs
+
+
+configsCutlassBlackwell = [
+    (
+        triton.Config(
+            {
+                "BLOCK_M": BM,
+                "BLOCK_M_HALF": BMhalf,
+                "BLOCK_N": BN,
+                "ENABLE_TMA": enable_tma,
+                "LOOP_SCHEDULE": sched,
+                "GRID_MULTIPLE": mult,
+                "FIRST_MMA": 1,
+                "LAST_MMA": 1,
+                "FIRST_SOFTMAX": 3,
+                "LAST_SOFTMAX": 4,
+                "LOAD_K": 2,
+                "LOAD_V": 2,
+                "FIRST_CORRECTION": 0,
+                "LAST_CORRECTION": 0,
+                "ALPHA_REMAT": True,
+                "FIRST_LOADQ": 2,
+                "LAST_LOADQ": 2,
+            },
+            num_stages=2,
+            num_warps=w,
+        )
+    )
+    for BM in [128]
+    for BMhalf in [64]
+    for BN in [128]
+    for mult in [1]
+    for sched in schedList
+    for enable_tma in [True]
+    for enable_ws in [True]
+    for w in [4]
+]
+
+
+configsTKBlackwell = [  # ThunderKitten
+    (
+        triton.Config(
+            {
+                "BLOCK_M": BM,
+                "BLOCK_M_HALF": BMhalf,
+                "BLOCK_N": BN,
+                "ENABLE_TMA": enable_tma,
+                "LOOP_SCHEDULE": sched,
+                "GRID_MULTIPLE": mult,
+                "FIRST_MMA": 2,
+                "LAST_MMA": 3,
+                "FIRST_SOFTMAX": 0,
+                "LAST_SOFTMAX": 1,
+                "LOAD_K": 4,
+                "LOAD_V": 5,
+                "FIRST_CORRECTION": 2,
+                "LAST_CORRECTION": 3,
+                "ALPHA_REMAT": False,
+                "FIRST_LOADQ": 0,
+                "LAST_LOADQ": 1,
+            },
+            num_stages=2,
+            num_warps=w,
+        )
+    )
+    for BM in [128]
+    for BMhalf in [64]
+    for BN in [128]
+    for mult in [1]
+    for sched in schedList
+    for enable_tma in [True]
+    for enable_ws in [True]
+    for w in [8]
+]
+
+
+@triton.autotune(list(filter(keep, configsCutlassBlackwell)), key=["N_CTX"])
+@triton.jit
+def _attn_fwd_tma_ws_persistent_with_dp(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
+    Q,
+    K,
+    V,
+    sm_scale,
+    M,
+    Out,  #
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,  #
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,  #
+    stride_vz,
+    stride_vh,
+    stride_vk,
+    stride_vn,  #
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_on,  #
+    Z,
+    H,
+    N_CTX,  #: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_M_HALF: tl.constexpr,
+    BLOCK_N: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,  #
+    STAGE: tl.constexpr,  #
+    ENABLE_TMA: tl.constexpr,
+    LOOP_SCHEDULE: tl.constexpr,
+    ENABLE_WS: tl.constexpr,
+    GRID_MULTIPLE: tl.constexpr,
+    FIRST_MMA: tl.constexpr,
+    LAST_MMA: tl.constexpr,
+    FIRST_SOFTMAX: tl.constexpr,
+    LAST_SOFTMAX: tl.constexpr,
+    LOAD_K: tl.constexpr,
+    LOAD_V: tl.constexpr,
+    FIRST_CORRECTION: tl.constexpr,
+    LAST_CORRECTION: tl.constexpr,
+    ALPHA_REMAT: tl.constexpr,
+    FIRST_LOADQ: tl.constexpr,
+    LAST_LOADQ: tl.constexpr,
+):
+    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    # original grid
+    #   triton.cdiv(q.shape[2], META["BLOCK_M"]),
+    #   q.shape[0] * q.shape[1],
+    n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
+    prog_id = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    total_tiles = n_tile_num * Z * H
+
+    tiles_per_sm = total_tiles // num_progs
+    if prog_id < total_tiles % num_progs:
+        tiles_per_sm += 1
+
+    tile_idx = prog_id
+
+    desc_k = tl.make_tensor_descriptor(
+        K,
+        shape=[Z * H * N_CTX, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM],
+    )
+    if V.dtype == torch.float8_e5m2:
+        desc_v = tl.make_tensor_descriptor(
+            V,
+            shape=[Z * H * HEAD_DIM, N_CTX],
+            strides=[N_CTX, 1],
+            block_shape=[HEAD_DIM, BLOCK_N],
+        )
+    else:
+        desc_v = tl.make_tensor_descriptor(
+            V,
+            shape=[Z * H * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[BLOCK_N, HEAD_DIM],
+        )
+
+    desc_q = tl.make_tensor_descriptor(
+        Q,
+        shape=[Z * H * N_CTX, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M_HALF, HEAD_DIM],
+    )
+    desc_o = tl.make_tensor_descriptor(
+        Out,
+        shape=[Z * H * N_CTX, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M_HALF, HEAD_DIM],
+    )
+
+    for _ in tl.range(0, tiles_per_sm, num_stages=1):
+        # This has much better cache locality than
+        #     pid = tile_idx // (Z * H)
+        #     off_hz = tile_idx % (Z * H)  # tl.program_id(1)
+        pid = tile_idx % n_tile_num
+        off_hz = tile_idx // n_tile_num
+        _attn_fwd_compute_ws_with_dp(
             Q,
             K,
             V,
@@ -1322,11 +2097,23 @@ def _attn_fwd_tma_ws_persistent(  # Q, V, desc_k, desc_v, sm_scale, M, Out,  #
             H,
             N_CTX,  #: tl.constexpr,  #
             BLOCK_M,
+            BLOCK_M_HALF,
             BLOCK_N,
             HEAD_DIM,
             STAGE,
             ENABLE_TMA,
             LOOP_SCHEDULE,
+            FIRST_MMA,
+            LAST_MMA,
+            FIRST_SOFTMAX,
+            LAST_SOFTMAX,
+            LOAD_K,
+            LOAD_V,
+            FIRST_CORRECTION,
+            LAST_CORRECTION,
+            ALPHA_REMAT,
+            FIRST_LOADQ,
+            LAST_LOADQ,
         )
         tile_idx += num_progs
 
@@ -1930,9 +2717,10 @@ class _attention_opt(torch.autograd.Function):
                 HEAD_DIM=HEAD_DIM_K,  #
                 STAGE=stage,  #
                 ENABLE_WS=True,
+                HAS_EXPLICIT_WS=HAS_EXPLICIT_WS,
                 **extra_kern_args,
             )
-        elif baseVariant == "tma":
+        elif baseVariant == "tma_ws" or baseVariant == "tma":
             _attn_fwd_tma_unified[grid_tma](
                 q,
                 k,
@@ -1961,43 +2749,45 @@ class _attention_opt(torch.autograd.Function):
                 N_CTX=q.shape[2],
                 HEAD_DIM=HEAD_DIM_K,
                 STAGE=stage,
-                ENABLE_WS=False,  # Disable warp specialization for regular TMA
-                **extra_kern_args,
-            )
-        elif baseVariant == "tma_ws":
-            _attn_fwd_tma_unified[grid_tma](
-                q,
-                k,
-                v,
-                sm_scale,
-                M,
-                o,
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                q.stride(3),
-                k.stride(0),
-                k.stride(1),
-                k.stride(2),
-                k.stride(3),
-                v.stride(0),
-                v.stride(1),
-                v.stride(2),
-                v.stride(3),
-                o.stride(0),
-                o.stride(1),
-                o.stride(2),
-                o.stride(3),
-                q.shape[0],
-                q.shape[1],
-                N_CTX=q.shape[2],
-                HEAD_DIM=HEAD_DIM_K,
-                STAGE=stage,
-                ENABLE_WS=True,  # Enable warp specialization
+                ENABLE_WS=True if baseVariant == "tma_ws" else False,
+                HAS_EXPLICIT_WS=HAS_EXPLICIT_WS,
                 **extra_kern_args,
             )
         elif baseVariant == "tma_ws_persistent":
             _attn_fwd_tma_ws_persistent[grid_tma_persistent](
+                q,
+                k,
+                v,
+                sm_scale,
+                M,
+                o,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),  #
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                k.stride(3),  #
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                v.stride(3),  #
+                o.stride(0),
+                o.stride(1),
+                o.stride(2),
+                o.stride(3),  #
+                q.shape[0],
+                q.shape[1],  #
+                N_CTX=q.shape[2],  #
+                HEAD_DIM=HEAD_DIM_K,  #
+                STAGE=stage,  #
+                ENABLE_WS=True,
+                HAS_EXPLICIT_WS=HAS_EXPLICIT_WS,
+                **extra_kern_args,
+            )
+        elif baseVariant == "tma_ws_persistent_blackwell":
+            _attn_fwd_tma_ws_persistent_with_dp[grid_tma_persistent](
                 q,
                 k,
                 v,
