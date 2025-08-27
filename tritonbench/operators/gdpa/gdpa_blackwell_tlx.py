@@ -139,6 +139,69 @@ def _load_tma(
 #   qk0, qk1: producers
 #   p0, p1: sharing tmem spaces, and barriers with qk0, qk1 (consumers)
 #   o0, o1
+
+
+@triton.jit
+def _add_f32x2(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            add.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
+def _mul_f32x2(a, b):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mul.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
+def _fma_f32x2(a, b, c):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mov.b64 rc, { $6, $7 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { $0, $1 }, rd;
+        }
+        """,
+        "=r,=r,r,r,r,r,r,r",
+        [a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
 @triton.jit
 def tanh_approx_fp32(x):
     output = tl.inline_asm_elementwise(
@@ -161,7 +224,7 @@ def subtiled_activation(qk_view, qk_scale, dtype, HEAD_DIM):
     qk0 = tlx.local_load(qk_view_1st)  # , tlx.storage_kind.tmem)
     # ConsumerWait for qk, ProducerAcquire for p
     p0 = fast_gelu(qk0)
-    p0 *= qk_scale
+    # p0 *= qk_scale
     p0 = p0.to(dtype)
     p0_view = tlx.local_reinterpret(qk_view_1st, dtype)
     tlx.local_store(p0_view, p0)  # , tlx.storage_kind.tmem)
@@ -170,7 +233,7 @@ def subtiled_activation(qk_view, qk_scale, dtype, HEAD_DIM):
     qk0 = tlx.local_load(qk_view_2nd)  # , tlx.storage_kind.tmem)
     # ConsumerWait for qk, ProducerAcquire for p
     p0 = fast_gelu(qk0)
-    p0 *= qk_scale
+    # p0 *= qk_scale
     p0 = p0.to(dtype)
     p0_view = tlx.local_reinterpret(qk_view_2nd, dtype)
     tlx.local_store(p0_view, p0)
@@ -179,7 +242,17 @@ def subtiled_activation(qk_view, qk_scale, dtype, HEAD_DIM):
 # typical configuration is 3/fast_gelu
 @triton.jit
 def fast_gelu(x):
-    return x * 0.5 * (1 + tanh_approx_fp32(0.7978845608 * x * (1.0 + 0.044715 * x * x)))
+    # following D80750725
+    # was * scaling
+    # return x * 0.5 * (1 + tanh_approx_fp32(0.7978845608 * x * (1.0 + 0.044715 * x * x)))
+    c1 = 0.0356774081
+    c0 = 0.7978845608
+    square = _mul_f32x2(x, x)
+    inner = _fma_f32x2(c1, square, c0)
+    inner = _mul_f32x2(inner, x)
+    out = _fma_f32x2(x, tanh_approx_fp32(inner), x)
+    return out  # x * tanh((c1 * x * x + c0)*x) + x
+    # return tanh_approx_fp32(x)
 
 
 @triton.autotune(
@@ -374,7 +447,7 @@ def gdpa_kernel_tma_ws_blackwell(
                         qk0 = tlx.local_load(qk_view_1st)  # , tlx.storage_kind.tmem)
                         # ConsumerWait for qk, ProducerAcquire for p
                         p0 = fast_gelu(qk0)
-                        p0 *= qk_scale
+                        # p0 *= qk_scale
                         p0 = p0.to(dtype)
                         p0_view = tlx.local_reinterpret(qk_view_1st, dtype)
                         tlx.local_store(p0_view, p0)  # , tlx.storage_kind.tmem)
@@ -385,7 +458,7 @@ def gdpa_kernel_tma_ws_blackwell(
                         qk0 = tlx.local_load(qk_view_2nd)  # , tlx.storage_kind.tmem)
                         # ConsumerWait for qk, ProducerAcquire for p
                         p0 = fast_gelu(qk0)
-                        p0 *= qk_scale
+                        # p0 *= qk_scale
                         p0 = p0.to(dtype)
                         p0_view = tlx.local_reinterpret(qk_view_2nd, dtype)
                         tlx.local_store(p0_view, p0)
@@ -476,7 +549,7 @@ def gdpa_kernel_tma_ws_blackwell(
                         qk0 = tlx.local_load(qk_view_1st)  # , tlx.storage_kind.tmem)
                         # ConsumerWait for qk, ProducerAcquire for p
                         p0 = fast_gelu(qk0)
-                        p0 *= qk_scale
+                        # p0 *= qk_scale
                         p0 = p0.to(dtype)
                         p0_view = tlx.local_reinterpret(qk_view_1st, dtype)
                         tlx.local_store(p0_view, p0)  # , tlx.storage_kind.tmem)
@@ -487,7 +560,7 @@ def gdpa_kernel_tma_ws_blackwell(
                         qk0 = tlx.local_load(qk_view_2nd)  # , tlx.storage_kind.tmem)
                         # ConsumerWait for qk, ProducerAcquire for p
                         p0 = fast_gelu(qk0)
-                        p0 *= qk_scale
+                        # p0 *= qk_scale
                         p0 = p0.to(dtype)
                         p0_view = tlx.local_reinterpret(qk_view_2nd, dtype)
                         tlx.local_store(p0_view, p0)
