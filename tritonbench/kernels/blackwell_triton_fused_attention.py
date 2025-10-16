@@ -15,6 +15,8 @@ import torch
 
 import triton
 import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_compat import libdevice
 from triton.tools.tensor_descriptor import TensorDescriptor
 from tritonbench.utils.env_utils import is_tile_enabled
 
@@ -71,14 +73,14 @@ def _attn_fwd_subtile(
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk -= m_ij[:, None]
     else:
-        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        m_ij = triton_helpers.maximum(m_i, tl.max(qk, 1) * qk_scale)
         if VECT_MUL & 2:
             qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
         else:
             qk = qk * qk_scale - m_ij[:, None]
-    p = tl.math.exp2(qk)
+    p = libdevice.exp2(qk)
     # -- compute correction factor
-    alpha = tl.math.exp2(m_i - m_ij)
+    alpha = libdevice.exp2(m_i - m_ij)
     if not FADD2_REDUCE:
         l_ij = tl.sum(p, 1)
 
@@ -258,6 +260,7 @@ else:
             "num_stages": s,
             "num_warps": w,
             "pre_hook": _host_descriptor_pre_hook,
+            # "ir_override": f"fa-override/_attn_fwd_persist.ttir",
         }
 
         # Only add minRegAutoWS/maxRegAutoWS if supported (triton/tree/ws-3.5)
@@ -270,13 +273,13 @@ else:
     configs = [
         make_standard_config(BM, BN, s, w, subtile, vectmul, add2reduce, maxreg)
         for BM in [256]
-        for BN in [64, 128]
+        for BN in [128]  # 64, 128]
         for s in NUM_STAGES_OPTIONS
         for w in [4]
         for subtile in [True]
         for vectmul in [1]
         for add2reduce in [False]
-        for maxreg in [152, 192]
+        for maxreg in [192]  # 152, 192]
     ]
 
 
@@ -472,7 +475,7 @@ def _attn_fwd_tma_dp(
     else:
         l_i0 = l_i0_0
 
-    m_i0 += tl.math.log2(l_i0)
+    m_i0 += libdevice.log2(l_i0)
     acc0 = acc0 / l_i0[:, None]
     m_ptrs0 = M + off_hz * N_CTX + offs_m0
     tl.store(m_ptrs0, m_i0)
@@ -540,13 +543,13 @@ def _attn_fwd(
 )
 @triton.jit
 def _attn_fwd_persist(
-    sm_scale,
-    M,  #
-    Z,
-    H,
+    sm_scale,  #: tl.constexpr,
+    Z: tl.constexpr,
+    H: tl.constexpr,
     desc_q,
     desc_k,
     desc_v,
+    M,  #
     desc_o,
     N_CTX: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
@@ -703,12 +706,12 @@ class _attention_opt(torch.autograd.Function):
         if persistent:
             _attn_fwd_persist[grid_persist](
                 sm_scale,
-                M,  #
                 q.shape[0],
                 q.shape[1],  #
                 desc_q,
                 desc_k,
                 desc_v,
+                M,  #
                 desc_o,  #
                 N_CTX=q.shape[2],  #
                 HEAD_DIM=HEAD_DIM_K,  #
