@@ -155,7 +155,7 @@ def _attn_fwd_inner_oss_dp(
     # causal = False
     else:
         lo, hi = 0, N_CTX
-    offsetkv_y = offset_y + lo
+    # offsetkv_y = offset_y + lo
 
     # loop over k, v and update accumulator
     for start_n in tl.range(
@@ -166,6 +166,7 @@ def _attn_fwd_inner_oss_dp(
         disallow_acc_multi_buffer=True,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+        offsetkv_y = offset_y + start_n
 
         k = desc_k.load([offsetkv_y, 0]).T
         v = desc_v.load([offsetkv_y, 0])
@@ -189,7 +190,7 @@ def _attn_fwd_inner_oss_dp(
             FADD2_REDUCE,
         )
 
-        offsetkv_y += BLOCK_N
+        # offsetkv_y += BLOCK_N
 
     return acc0, l_i0, l_i0_1, m_i0
 
@@ -382,6 +383,7 @@ def _attn_fwd_tma_dp(
     desc_o,
     pid,
     off_hz,
+    tile_idx,
     N_CTX: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,  #
     BLOCK_M: tl.constexpr,  #
@@ -393,14 +395,21 @@ def _attn_fwd_tma_dp(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    HELION_GRID: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    if HELION_GRID:
+        qo_offset_y = tile_idx * BLOCK_M
+        # indices_0 is off_hz * N_CTX + offs_m0
+        indices_0 = (qo_offset_y + tl.arange(0, BLOCK_M)).to(tl.int32)
+        offset_y = 8192 * triton_helpers.div_floor_integer(qo_offset_y, 8192)
+    else:
+        off_z = off_hz // H
+        off_h = off_hz % H
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
+        offset_y = off_z * (N_CTX * H) + off_h * N_CTX
+        qo_offset_y = offset_y + start_m * BLOCK_M
     # initialize offsets
     offs_m0 = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -477,7 +486,10 @@ def _attn_fwd_tma_dp(
 
     m_i0 += libdevice.log2(l_i0)
     acc0 = acc0 / l_i0[:, None]
-    m_ptrs0 = M + off_hz * N_CTX + offs_m0
+    if HELION_GRID:
+        m_ptrs0 = M + indices_0 * 1
+    else:
+        m_ptrs0 = M + off_hz * N_CTX + offs_m0
     tl.store(m_ptrs0, m_i0)
     desc_o.store([qo_offset_y, 0], acc0.to(dtype))
 
@@ -621,6 +633,7 @@ def _attn_fwd_persist(
             desc_o,
             pid,
             off_hz,
+            tile_idx,
             N_CTX,
             HEAD_DIM,
             BLOCK_M,
@@ -632,6 +645,7 @@ def _attn_fwd_persist(
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            True,  # HELION_GRID
         )
         tile_idx += num_progs
 
