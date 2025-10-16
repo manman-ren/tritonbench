@@ -586,7 +586,7 @@ def _attn_fwd_persist(
     if prog_id < total_tiles % num_progs:
         tiles_per_sm += 1
 
-    tile_idx = prog_id
+    # tile_idx = prog_id
 
     desc_q = tl.make_tensor_descriptor(
         desc_q,
@@ -614,9 +614,13 @@ def _attn_fwd_persist(
     )
 
     # inner loop warpspec vs. outer loop warpspec
-    for _ in tl.range(
-        0,
-        tiles_per_sm,
+    # for _ in tl.range(
+    # 0,
+    # tiles_per_sm,
+    for tile_idx in tl.range(
+        tl.program_id(0),
+        total_tiles,
+        num_progs,
         warp_specialize=warp_specialize and OUTER_LOOP,
         data_partition_factor=DP_FACTOR,
     ):
@@ -647,7 +651,7 @@ def _attn_fwd_persist(
             FADD2_REDUCE,
             True,  # HELION_GRID
         )
-        tile_idx += num_progs
+        # tile_idx += num_progs
 
 
 def torch_dtype_to_triton(dtype):
